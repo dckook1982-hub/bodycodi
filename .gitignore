@@ -1,0 +1,13 @@
+# Claude Code 로컬 설정 (PC마다 다름 — 공유 대상 아님)
+.claude/settings.local.json
+
+# 예전 버전(v1.4.0) 백업 파일 — 현재 파일과 중복
+*\ (2).*
+
+# 관리자 전용 키 (절대 커밋 금지)
+*.pem
+
+# OS/편집기 부산물
+Thumbs.db
+desktop.ini
+.DS_Store

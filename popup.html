@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      width: 400px;
+      padding: 14px;
+      font-size: 13px;
+      color: #222;
+    }
+    h2 { margin: 0 0 4px; font-size: 15px; color: #1a73e8; }
+    .subtitle { font-size: 11px; color: #888; margin-bottom: 12px; }
+    .btn-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    button {
+      padding: 7px 12px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #f8f9fa;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { background: #e8eaed; }
+    button.primary {
+      background: #1a73e8;
+      color: white;
+      border-color: #1a73e8;
+    }
+    button.primary:hover { background: #1557b0; }
+    button:disabled {
+      background: #f1f3f4;
+      color: #aaa;
+      cursor: not-allowed;
+    }
+    #statusMsg {
+      min-height: 18px;
+      font-size: 12px;
+      color: #444;
+      margin: 6px 0;
+    }
+    hr { border: none; border-top: 1px solid #e0e0e0; margin: 10px 0; }
+    h4 { margin: 8px 0 4px; font-size: 13px; }
+    .mapping-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 4px 0;
+    }
+    .coach-label {
+      flex: 1;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .mapping-row select {
+      flex: 2;
+      font-size: 12px;
+      padding: 3px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+    }
+    #saveMapping { display: none; margin-top: 6px; }
+    pre {
+      background: #f5f5f5;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 11px;
+      max-height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    #resultBox { max-height: 120px; }
+    #logs { max-height: 280px; }
+
+    /* ---------- Onboarding ---------- */
+    #onboarding {
+      background: linear-gradient(135deg, #e8f0fe 0%, #f8f9fa 100%);
+      border: 1px solid #c3d4f0;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    #onboarding h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+      color: #1a73e8;
+    }
+    #onboarding ol {
+      margin: 4px 0 8px;
+      padding-left: 20px;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    #onboarding li {
+      margin-bottom: 4px;
+    }
+    #onboarding li.done { color: #1e8e3e; }
+    #onboarding li.done::marker { content: "✓ "; }
+    #onboarding .hint {
+      font-size: 11px;
+      color: #666;
+      margin-top: 6px;
+      padding: 6px 8px;
+      background: rgba(255, 255, 255, 0.6);
+      border-radius: 4px;
+    }
+    #onboarding .open-btn {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 11px;
+      color: #1a73e8;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    .hidden { display: none !important; }
+
+    /* ---------- Progress Bar ---------- */
+    #progressContainer { margin: 6px 0 8px; }
+    .progress-bar-wrap {
+      width: 100%;
+      height: 18px;
+      background: #e8eaed;
+      border-radius: 9px;
+      overflow: hidden;
+      border: 1px solid #d0d4d9;
+      box-sizing: border-box;
+    }
+    #progressBar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #1a73e8 0%, #4285f4 100%);
+      color: white;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 18px;
+      text-align: center;
+      transition: width 0.25s ease;
+      white-space: nowrap;
+      box-sizing: border-box;
+    }
+    #progressLabel {
+      font-size: 11px;
+      color: #5f6368;
+      margin-top: 4px;
+      min-height: 14px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>BodyCodi → GCal Sync <span id="versionBadge" style="font-size:10px;color:#5f6368;font-weight:400;">(v?)</span></h2>
+  <div class="subtitle">바디코디 스케줄 → 구글캘린더 제목 자동 업데이트</div>
+
+  <!-- ---------- 온보딩 (첫 설치 시 보임) ---------- -->
+  <div id="onboarding" class="hidden">
+    <h3>👋 처음 설치하셨군요! 3단계 설정</h3>
+    <ol id="onboardingSteps">
+      <li id="step1">바디코디 스케줄 페이지 열기</li>
+      <li id="step2">아래 <b>"강사 목록 불러오기"</b> 클릭 → 구글 로그인</li>
+      <li id="step3">강사별 캘린더 선택 → <b>"매핑 저장"</b></li>
+    </ol>
+    <div class="hint">
+      ※ 매핑 저장 후에는 매일 09시·13시·17시 자동 동기화됩니다.<br>
+      ※ "지금 동기화" 버튼으로 즉시 실행도 가능합니다.
+    </div>
+    <span class="open-btn" id="openBodyCodiBtn">→ 바디코디 스케줄 페이지 열기</span>
+  </div>
+
+  <div class="btn-row">
+    <button class="primary" id="syncNow">▶ 지금 동기화</button>
+    <button id="dryRun">🔍 미리보기</button>
+  </div>
+
+  <div id="statusMsg"></div>
+
+  <div id="progressContainer" class="hidden">
+    <div class="progress-bar-wrap">
+      <div id="progressBar">0%</div>
+    </div>
+    <div id="progressLabel"></div>
+  </div>
+
+  <pre id="resultBox"></pre>
+
+  <hr>
+
+  <h4>⚙ 강사 → 캘린더 매핑</h4>
+  <p style="font-size:11px;color:#666;margin:4px 0 8px;">
+    바디코디 스케줄 탭을 연 상태에서 아래 버튼을 누르세요.
+  </p>
+  <button id="refreshCoaches">🔄 강사 목록 불러오기</button>
+  <div id="mappingRows" style="margin-top:8px;"></div>
+  <button id="saveMapping" class="primary">💾 매핑 저장</button>
+
+  <hr>
+
+  <h4>📋 최근 로그</h4>
+  <pre id="logs">(아직 실행 기록 없음)</pre>
+
+  <script src="popup.js"></script>
+</body>
+</html>
