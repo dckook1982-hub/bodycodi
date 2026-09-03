@@ -125,6 +125,56 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 });
 
+// ---------- 결과 표시 (사람이 읽기 쉬운 형태) ----------
+// 원본 details는 244건까지 나오는 JSON이라 눈으로 훑기 어렵다.
+// "이미 동기화됨"은 조치가 필요 없으므로 감추고, 실제로 바뀐 것만 분류해서 보여준다.
+function fmtWhen(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const W = ['일', '월', '화', '수', '목', '금', '토'];
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()}(${W[d.getDay()]}) ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderResult(details, dryRun) {
+  const list = details || [];
+
+  const failed  = list.filter(d => d.실패);
+  const moved   = list.filter(d => d.시간이동 && !d.실패);
+  const updated = list.filter(d => !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
+  const skipped = list.filter(d => d.매칭 === false);
+
+  const alreadyOk = list.length - failed.length - moved.length - updated.length - skipped.length;
+
+  if (!failed.length && !moved.length && !updated.length && !skipped.length) {
+    return `✅ 조치가 필요한 항목이 없습니다.\n   (${alreadyOk}건 모두 이미 동기화된 상태)`;
+  }
+
+  const out = [];
+  const addSection = (icon, title, items, fmt) => {
+    if (!items.length) return;
+    out.push(`${icon} ${title} — ${items.length}건`);
+    items.forEach(d => out.push(fmt(d)));
+    out.push('');
+  };
+
+  addSection('❌', '실패', failed, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.실패}`);
+
+  addSection('🕒', dryRun ? '시간 이동 예정' : '시간 이동됨', moved, d =>
+    `   · ${(d.회원 || '').trim()}  ${d.프로그램 || ''}\n     ${d.시간이동}`);
+
+  addSection('✏️', dryRun ? '제목/설명 변경 예정' : '제목/설명 업데이트됨', updated, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.새제목 || ''}`);
+
+  addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀', skipped, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
+
+  if (alreadyOk > 0) out.push(`✅ 이미 동기화됨 — ${alreadyOk}건 (표시 생략)`);
+
+  return out.join('\n').trim();
+}
+
 function runSync(dryRun) {
   setStatus(dryRun ? '🔍 미리보기 실행 중... (2주: 이번 주+다음 주)' : '🔄 동기화 중... (2주: 이번 주+다음 주)');
   document.getElementById('resultBox').textContent = '';
@@ -160,8 +210,7 @@ function runSync(dryRun) {
     showProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
     setTimeout(hideProgress, 1500);
 
-    document.getElementById('resultBox').textContent =
-      JSON.stringify(s.details, null, 2);
+    document.getElementById('resultBox').textContent = renderResult(s.details, dryRun);
 
     loadLogsAndResult();
   });
@@ -514,6 +563,15 @@ document.getElementById('saveMapping').addEventListener('click', async () => {
   setTimeout(() => {
     document.getElementById('onboarding').classList.add('hidden');
   }, 1500);
+});
+
+// ---------- 로그 접기/펼치기 (기본: 접힘) ----------
+document.getElementById('toggleLogs').addEventListener('click', () => {
+  const logs = document.getElementById('logs');
+  const btn = document.getElementById('toggleLogs');
+  const willShow = logs.classList.contains('hidden');
+  logs.classList.toggle('hidden', !willShow);
+  btn.textContent = willShow ? '▼ 접기' : '▶ 펼치기';
 });
 
 // ---------- 로그 갱신 ----------

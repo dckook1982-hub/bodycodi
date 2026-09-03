@@ -72,8 +72,24 @@
       white-space: pre-wrap;
       word-break: break-all;
     }
-    #resultBox { max-height: 120px; }
+    #resultBox { max-height: 260px; line-height: 1.5; }
+    #resultBox:empty { display: none; }
     #logs { max-height: 280px; }
+
+    /* 섹션 헤더 + 토글 버튼 */
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 8px 0 4px;
+    }
+    .section-head h4 { margin: 0; }
+    button.mini {
+      padding: 2px 8px;
+      font-size: 11px;
+      border-radius: 4px;
+      color: #5f6368;
+    }
 
     /* ---------- Onboarding ---------- */
     #onboarding {
@@ -200,8 +216,11 @@
 
   <hr>
 
-  <h4>📋 최근 로그</h4>
-  <pre id="logs">(아직 실행 기록 없음)</pre>
+  <div class="section-head">
+    <h4>📋 최근 로그</h4>
+    <button id="toggleLogs" class="mini">▶ 펼치기</button>
+  </div>
+  <pre id="logs" class="hidden">(아직 실행 기록 없음)</pre>
 
   <script src="popup.js"></script>
 </body>
