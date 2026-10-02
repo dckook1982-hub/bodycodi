@@ -3,6 +3,7 @@
 // background.js
 // - 2주(이번 주 일요일 ~ 다음 주 토요일) 전체 동기화
 // - 제목 포맷: "회원번호 성함 연락처 프로그램이름" (회원번호 없으면 생략)
+// - 설명 자동 라인(v1.13.0): "프로그램명 / 유효기간 / 총횟수 / 잔여횟수" (사용자 메모는 보존)
 // - v1.9.0: 평가 프로그램(담당쌤 동작기능평가/대표원장 관절기능평가)은 "N회차"를 제목 끝에 보존
 // - popup.js의 __bcPopup 메시지 구조에 맞춤
 // ================================================
@@ -229,10 +230,59 @@ async function extractSchedulesFromBodyCodi() {
         const REMAIN_KEYS = ['remainNumber','remain_count','rest_count','remain_cnt','rest_cnt','remain_use_cnt','rest_use_cnt','remainCount','remainCnt','restCount','restCnt','remainUseCount','avail_count','available_count','availableCount','left_count','leftCount'];
         const USE_KEYS    = ['useNumber','use_count','used_count','useCount','usedCount','use_cnt','used_cnt'];
 
+        // ⭐ v1.13.0: 이용권 유효기간(만료일/시작일) 후보 필드명
+        //   start_date / end_date 는 "예약 시각"이므로 반드시 제외한다
+        const EXPIRE_KEYS = [
+          'useEndDate','use_end_date','expireDate','expire_date','expiryDate','expiry_date',
+          'validEndDate','valid_end_date','endDay','end_day','limitDate','limit_date',
+          'serviceEndDate','service_end_date','membershipEndDate','membership_end_date',
+          'periodEndDate','period_end_date','useLimitDate','use_limit_date','deadline','endDt','end_dt'
+        ];
+        const VALID_START_KEYS = [
+          'useStartDate','use_start_date','validStartDate','valid_start_date','startDay','start_day',
+          'serviceStartDate','service_start_date','membershipStartDate','membership_start_date',
+          'periodStartDate','period_start_date','startDt','start_dt'
+        ];
+        const EVENT_TIME_KEYS = new Set(['start_date','end_date','start','end']);
+
+        // 날짜형 값 → "YYYY-MM-DD" (Date 객체, "2026-12-31", "2026.12.31", "20261231", "2026-12-31 23:59:59" 허용)
+        const toYmd = (v) => {
+          if (v === null || v === undefined || v === '') return null;
+          if (v instanceof Date) {
+            if (isNaN(v.getTime())) return null;
+            const p = n => String(n).padStart(2, '0');
+            return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())}`;
+          }
+          const s = String(v).trim();
+          const m = s.match(/^(\d{4})[-.\/]?(\d{2})[-.\/]?(\d{2})(?:[T\s].*)?$/);
+          if (!m) return null;
+          const y = +m[1], mo = +m[2], d = +m[3];
+          if (y < 2000 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+          return `${m[1]}-${m[2]}-${m[3]}`;
+        };
+        // 1) 알려진 후보 키 → 2) 키 이름에 end/expire/limit/valid 등이 들어가고 값이 날짜형인 필드(휴리스틱)
+        const getDateField = (ev, candidates, heuristicRe) => {
+          for (const k of candidates) {
+            if (!(k in ev)) continue;
+            const ymdv = toYmd(ev[k]);
+            if (ymdv) return { value: ymdv, key: k };
+          }
+          if (heuristicRe) {
+            for (const k of Object.keys(ev)) {
+              if (EVENT_TIME_KEYS.has(k) || !heuristicRe.test(k)) continue;
+              const ymdv = toYmd(ev[k]);
+              if (ymdv) return { value: ymdv, key: k };
+            }
+          }
+          return { value: null, key: null };
+        };
+
         // 진단용
         let _firstEventKeys = null;
         let _firstEventNumericFields = null;
+        let _firstEventDateLikeFields = null;
         let _countDiscovery = { withTotal: 0, withRemain: 0, withBoth: 0, total: 0 };
+        let _expireDiscovery = { withExpire: 0, withStart: 0, total: 0, expireKey: null, startKey: null };
         let _assessDiscovery = { count: 0, withMember: 0, withRound: 0, sampleText: null, sampleFields: null };
 
         const result = events.map((ev, idx) => {
@@ -350,20 +400,35 @@ async function extractSchedulesFromBodyCodi() {
             round = useCount + 1;
           }
 
-          // 진단: 첫 이벤트의 모든 키 + 숫자 필드 dump
+          // ⭐ v1.13.0: 이용권 유효기간 (만료일 필수, 시작일은 있으면 "시작 ~ 만료"로 표기)
+          const expire = getDateField(ev, EXPIRE_KEYS, /(end|expir|limit|valid|deadline|만료|종료)/i);
+          const vstart = expire.value
+            ? getDateField(ev, VALID_START_KEYS, /(start|begin|시작)/i)
+            : { value: null, key: null };
+          let validPeriod = null;
+          if (expire.value) {
+            validPeriod = vstart.value ? `${vstart.value} ~ ${expire.value}` : expire.value;
+          }
+
+          // 진단: 첫 이벤트의 모든 키 + 숫자 필드 + 날짜형 필드 dump
           if (idx === 0) {
             _firstEventKeys = Object.keys(ev).sort();
             _firstEventNumericFields = {};
+            _firstEventDateLikeFields = {};
             for (const k of _firstEventKeys) {
               const v = ev[k];
               if (typeof v === 'number' && Number.isFinite(v)) _firstEventNumericFields[k] = v;
               else if (typeof v === 'string' && /^-?\d+$/.test(v.trim()) && v.length < 12) _firstEventNumericFields[k] = '"'+v+'"';
+              if (!EVENT_TIME_KEYS.has(k) && toYmd(v)) _firstEventDateLikeFields[k] = toYmd(v);
             }
           }
           _countDiscovery.total++;
           if (totalCount  !== null) _countDiscovery.withTotal++;
           if (remainCount !== null) _countDiscovery.withRemain++;
           if (totalCount !== null && remainCount !== null) _countDiscovery.withBoth++;
+          _expireDiscovery.total++;
+          if (expire.value) { _expireDiscovery.withExpire++; _expireDiscovery.expireKey ||= expire.key; }
+          if (vstart.value) { _expireDiscovery.withStart++;  _expireDiscovery.startKey  ||= vstart.key; }
 
           // ⭐ v1.9.0: 평가 이벤트 진단 (포맷이 다를 경우 원인 파악용)
           if (isAssessment) {
@@ -400,6 +465,7 @@ async function extractSchedulesFromBodyCodi() {
             status:      String(ev.now_state || ev.status || ''),
             totalCount,
             remainCount,
+            validPeriod,
             isAssessment,
             round
           };
@@ -413,7 +479,9 @@ async function extractSchedulesFromBodyCodi() {
             _diagnostics: {
               firstEventKeys: _firstEventKeys,
               firstEventNumericFields: _firstEventNumericFields,
+              firstEventDateLikeFields: _firstEventDateLikeFields,
               countDiscovery: _countDiscovery,
+              expireDiscovery: _expireDiscovery,
               assessDiscovery: _assessDiscovery,
               prefetch: {
                 attempted: _prefetch.prefetched,
@@ -463,6 +531,8 @@ function buildTitle(ev) {
 // 기존 description에서 우리가 관리하는 라인만 골라서 제거 → 사용자 콘텐츠만 남김
 // 관리 라인:
 //   - "[bc-sync:ID]" (구버전 호환 — extendedProperties 이전 시대)
+//   - "프로그램명 : ..."     (⭐ v1.13.0, 이 접두어로 시작하는 라인)
+//   - "유효기간 : 날짜[ ~ 날짜]" (⭐ v1.13.0, 단독 라인일 때만)
 //   - "총횟수 : N회"        (단독 라인일 때만)
 //   - "잔여횟수 : N회"      (단독 라인일 때만)
 // "총횟수 : 20회 (중요)" 같이 뒤에 다른 글자가 붙으면 보존됩니다.
@@ -473,9 +543,11 @@ function stripManagedLines(description) {
   // 1) 구버전 [bc-sync:ID] 태그 제거
   s = s.replace(/\[bc-sync:[^\]]*\]/g, '');
 
-  // 2) 관리 라인(총횟수/잔여횟수) 제거 — 라인 단위로 정확히 일치하는 것만
+  // 2) 관리 라인(프로그램명/유효기간/총횟수/잔여횟수) 제거 — 라인 단위로 정확히 일치하는 것만
   s = s.split('\n').filter(line => {
     const t = line.trim();
+    if (/^프로그램명\s*:/.test(t)) return false;
+    if (/^유효기간\s*:\s*[\d\-.\/]+(\s*~\s*[\d\-.\/]+)?\s*$/.test(t)) return false;
     if (/^총횟수\s*:\s*\d+\s*회\s*$/.test(t)) return false;
     if (/^잔여횟수\s*:\s*\d+\s*회\s*$/.test(t)) return false;
     return true;
@@ -487,14 +559,23 @@ function stripManagedLines(description) {
   return s.trim();
 }
 
+// ⭐ v1.13.0: 자동 라인 목록 (값이 있는 항목만, 고정 순서)
+//   프로그램명 → 유효기간 → 총횟수 → 잔여횟수
+function buildAutoLines(ev) {
+  const auto = [];
+  if (ev.program) auto.push(`프로그램명 : ${ev.program}`);
+  if (ev.validPeriod) auto.push(`유효기간 : ${ev.validPeriod}`);
+  if (ev.totalCount  !== null && ev.totalCount  !== undefined) auto.push(`총횟수 : ${ev.totalCount}회`);
+  if (ev.remainCount !== null && ev.remainCount !== undefined) auto.push(`잔여횟수 : ${ev.remainCount}회`);
+  return auto;
+}
+
 // 새 description = 사용자 콘텐츠 + (선택적) 빈 줄 + 자동 라인
-// ev: { totalCount, remainCount, ... }
+// ev: { program, validPeriod, totalCount, remainCount, ... }
 // existingDescription: GCal에 이미 들어 있던 description
 function buildDescription(ev, existingDescription) {
   const userContent = stripManagedLines(existingDescription);
-  const auto = [];
-  if (ev.totalCount  !== null && ev.totalCount  !== undefined) auto.push(`총횟수 : ${ev.totalCount}회`);
-  if (ev.remainCount !== null && ev.remainCount !== undefined) auto.push(`잔여횟수 : ${ev.remainCount}회`);
+  const auto = buildAutoLines(ev);
 
   if (auto.length === 0) return userContent;            // 자동 정보 없으면 사용자 콘텐츠만
   if (!userContent)      return auto.join('\n');        // 사용자 콘텐츠 없으면 자동 정보만
@@ -538,6 +619,15 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     }
     const d = _diagnostics.countDiscovery || {};
     await appendLog(`🔬 횟수 추출: 총횟수발견=${d.withTotal||0}/${d.total||0}, 잔여횟수발견=${d.withRemain||0}/${d.total||0}`);
+    // ⭐ v1.13.0: 유효기간 추출 결과 — 어떤 필드에서 읽었는지 함께 기록 (오인 시 관리자가 확인 가능)
+    const x = _diagnostics.expireDiscovery || {};
+    if ((x.withExpire || 0) > 0) {
+      await appendLog(`📆 유효기간 추출: 만료일=${x.withExpire}/${x.total} (필드=${x.expireKey})` +
+        ((x.withStart || 0) > 0 ? `, 시작일=${x.withStart}/${x.total} (필드=${x.startKey})` : ''));
+    } else {
+      // 못 찾았을 때 첫 이벤트의 날짜형 필드를 모두 출력 → 실제 필드명 파악용
+      await appendLog(`📆 유효기간 추출: 0/${x.total || 0} — 날짜형 필드 후보: ${JSON.stringify(_diagnostics.firstEventDateLikeFields || {})}`);
+    }
     const a = _diagnostics.assessDiscovery || {};
     if (a.count > 0) {
       await appendLog(`🩺 평가 프로그램: ${a.count}건 (회원정보 추출 ${a.withMember}건, 회차 파악 ${a.withRound}건) 예시="${a.sampleText}"`);
@@ -713,11 +803,10 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       const newDesc = buildDescription(bc, match.description);
 
       // description 필드를 PATCH에 포함할지 결정 (보수적 정책):
-      //   - 추가할 자동 정보(총횟수/잔여횟수)가 있거나
+      //   - 추가할 자동 정보(프로그램명/유효기간/총횟수/잔여횟수)가 있거나
       //   - 정리할 레거시 [bc-sync:ID] 태그가 있을 때만 description 수정
-      //   - 그 외(OT상품 등 자동정보 없는 이벤트)에는 description 자체를 건드리지 않음 → 사용자 메모 100% 보존
-      const hasNewAuto    = (bc.totalCount  !== null && bc.totalCount  !== undefined) ||
-                            (bc.remainCount !== null && bc.remainCount !== undefined);
+      //   - 그 외(자동정보가 전혀 없는 이벤트)에는 description 자체를 건드리지 않음 → 사용자 메모 100% 보존
+      const hasNewAuto    = buildAutoLines(bc).length > 0;
       const hadLegacyTag  = /\[bc-sync:[^\]]*\]/.test(match.description || '');
       const shouldUpdateDesc = hasNewAuto || hadLegacyTag;
 

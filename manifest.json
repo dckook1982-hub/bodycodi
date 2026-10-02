@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BodyCodi → Google Calendar Sync",
-  "version": "1.12.1",
+  "version": "1.13.0",
   "description": "바디코디 스케줄표의 회원번호/성함/연락처/프로그램명을 구글캘린더 제목에 자동 반영",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsivHlTgKO1FegcM4O8/ef/ubGmZPpoR84QfZlVSlyc0zxmzDJwV4TA+NAKovIMHcYCRt/GljwIgHW/Oe7UbrNmAAl5T7eAwlsjd0TIlQUW//ZbPCNzn/a6CsSyF3SLfvBOs9WSnqGVDF8iijz7LRJlF22QrpsEC3+MClJud98KDxCYS6czKnoUP66HzcG2wwbfRgRdfgTmEJpJaRYIigdodEsZ9oaMU/ILUAtEzhkQ7gQMTRL3rS352XLQZevfiLzL3/CYqwcPLF8UdAI6J1rTnFTYuHgu7HnDucQ1Y5a9RphIAKnztLecM03WrpP15r079ZeUuQYcJYcSSUwkGmYQIDAQAB",
   "permissions": [
