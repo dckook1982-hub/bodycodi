@@ -9,7 +9,8 @@ echo ============================================================
 echo.
 echo   이 스크립트는 다음을 수행합니다:
 echo     1. Chrome 바로가기에서 --load-extension 플래그 제거
-echo     2. %%LOCALAPPDATA%%\bodycodi-sync 폴더 삭제
+echo     2. 자동 업데이트 작업 스케줄러 해제
+echo     3. %%LOCALAPPDATA%%\bodycodi-sync 폴더 삭제
 echo.
 echo   계속하시려면 Enter, 취소하려면 Ctrl+C
 pause >nul
@@ -54,7 +55,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& {
     Write-Host (\"      바로가기 \" + $cleaned + ' 개 정리됨.');
 
     Write-Host '';
-    Write-Host '[2/2] 확장 폴더 삭제 중...' -ForegroundColor Cyan;
+    Write-Host '[2/3] 자동 업데이트 작업 해제 중...' -ForegroundColor Cyan;
+    Unregister-ScheduledTask -TaskName 'BodyCodiSync-AutoUpdate' -Confirm:$false -ErrorAction SilentlyContinue;
+    & schtasks.exe /Delete /F /TN 'BodyCodiSync-AutoUpdate' 2>&1 | Out-Null;
+    Write-Host '      해제됨 (등록되어 있지 않았다면 무시)' -ForegroundColor Green;
+
+    Write-Host '';
+    Write-Host '[3/3] 확장 폴더 삭제 중...' -ForegroundColor Cyan;
     if (Test-Path $dstDir) {
         Remove-Item -Path $dstDir -Recurse -Force;
         Write-Host (\"      삭제됨: \" + $dstDir) -ForegroundColor Green;
