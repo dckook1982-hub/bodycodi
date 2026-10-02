@@ -140,6 +140,8 @@ bodycodi-sync/
 ├── manifest.json       # 확장 설정 ("key" 필드로 ID 고정)
 ├── background.js       # 동기화 로직, GCal API, 알람
 ├── bc-netlog.js        # (v1.13.1) 바디코디 페이지의 이용권 응답 탐지기 — 유효기간 필드 파악용
+├── AUTO-UPDATE.ps1     # (v1.13.2) GitHub main → 이 PC 자동 업데이트 (작업 스케줄러가 10분마다 실행)
+├── AUTO-UPDATE.vbs     # (v1.13.2) 위 스크립트를 창 없이 실행하는 래퍼
 ├── popup.html          # 팝업 UI (온보딩 포함)
 ├── popup.js            # 팝업 동작
 ├── popup.css           # (현재 popup.html 인라인 스타일 사용)
@@ -160,6 +162,30 @@ bodycodi-sync/
 
 ---
 
+## 🚀 자동 배포 (v1.13.2+) — GitHub main → 모든 직원 PC
+
+`INSTALL.bat`을 한 번 실행한 PC는 이후 **GitHub `main` 브랜치에 올라간 새 버전을 10분마다 스스로 내려받고**, 확장이 1분 안에 다시 불러옵니다. 관리자는 main에 머지만 하면 됩니다.
+
+**동작 원리**
+1. `INSTALL.bat` → Windows 작업 스케줄러에 `BodyCodiSync-AutoUpdate` 작업 등록 (10분 간격, 창 없이 실행)
+2. `AUTO-UPDATE.ps1`이 GitHub의 `manifest.json` 버전을 조회 → PC 버전보다 **높을 때만** 저장소 ZIP을 받아 확장 폴더에 덮어씀 (`manifest.json`은 마지막에 복사)
+3. 확장의 자동 리로드(아래)가 버전 변경을 감지해 재적용
+4. 결과는 `%LOCALAPPDATA%\bodycodi-sync\update.log`에 기록 (최신 상태면 기록 없음)
+
+**저장소가 비공개(private)인 경우** 둘 중 하나가 필요합니다:
+- (권장) GitHub 저장소를 **Public**으로 전환 — 저장소에는 비밀키(.pem)가 없고 OAuth client_id와 공개키만 있어 공개해도 무방합니다. 토큰 관리가 필요 없습니다.
+- 또는 GitHub에서 이 저장소 **Contents: Read-only** 권한의 fine-grained 토큰을 만들어, 각 PC의 `%LOCALAPPDATA%\bodycodi-sync\github-token.txt`에 한 줄로 저장
+
+**처음 한 번 (PC마다)**: 최신 ZIP을 받아 `INSTALL.bat` 실행. 이미 설치된 PC도 새 `INSTALL.bat`을 한 번 더 실행해야 작업 스케줄러가 등록됩니다. 저장소가 Public이면 PowerShell 창에 아래 한 줄을 붙여넣어도 됩니다:
+
+```powershell
+$t="$env:TEMP\bcsync"; Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $t | Out-Null; Invoke-WebRequest https://github.com/dckook1982-hub/bodycodi/archive/refs/heads/main.zip -OutFile "$t\s.zip"; Expand-Archive "$t\s.zip" $t; & (Get-ChildItem $t -Recurse -Filter SETUP-PERMANENT.ps1 | Select-Object -First 1).FullName
+```
+
+**되돌리기**: `UNINSTALL.bat`이 작업 스케줄러 등록도 함께 해제합니다.
+
+---
+
 ## 🔄 자동 업데이트 (v1.12.0+)
 
 확장 폴더의 파일이 갱신되면 **1분 안에 자동으로 감지해서 스스로 다시 불러옵니다.** chrome://extensions에서 새로고침 버튼을 누를 필요가 없습니다.
@@ -175,11 +201,11 @@ bodycodi-sync/
 
 ### 다른 직원 PC까지 자동 배포하려면
 
-위 기능은 "폴더의 파일이 바뀌면 크롬에 자동 반영"까지를 담당합니다. **파일을 각 PC로 내려받는 단계**는 아래 중 하나가 필요합니다:
+위 기능은 "폴더의 파일이 바뀌면 크롬에 자동 반영"까지를 담당합니다. **파일을 각 PC로 내려받는 단계**는 v1.13.2부터 위의 "🚀 자동 배포"가 담당합니다 (git 설치 불필요). 그 외 대안:
 
 | 방법 | 자동화 수준 | 필요 조건 |
 |---|---|---|
-| GitHub + 예약 작업 `git pull` | 완전 자동 | 각 PC에 git 설치 + Windows 작업 스케줄러 등록 |
+| 🚀 자동 배포 (v1.13.2+, 기본) | 완전 자동 | PC마다 `INSTALL.bat` 1회 + 저장소 Public 또는 읽기 토큰 |
 | Chrome 웹스토어 비공개 게시 | 완전 자동 (크롬이 몇 시간마다 갱신) | 개발자 등록비 $5(1회) + 업데이트마다 심사 대기 |
 | ZIP 전달 후 폴더 덮어쓰기 | 수동 배포 + 자동 반영 | 없음 (덮어쓰면 각 PC에서 자동 리로드됨) |
 
@@ -242,6 +268,7 @@ bodycodi-sync/
 
 ## 📌 버전
 
+- v1.13.2 — **🚀 자동 배포**: `INSTALL.bat`이 Windows 작업 스케줄러에 10분 간격 자동 업데이트 작업을 등록. 이후 GitHub `main`에 올라간 새 버전이 각 PC에 자동으로 내려받아지고(버전이 높을 때만), 확장이 1분 내 재적용. git 설치 불필요. 비공개 저장소는 Public 전환 또는 읽기 전용 토큰(`github-token.txt`) 필요. `UNINSTALL.bat`이 작업 해제까지 처리
 - v1.13.1 — **유효기간 탐색 강화**: ① 예약 데이터의 중첩 객체(1단계)·배열 첫 원소·epoch 숫자까지 만료일 후보로 탐색, 예약 당일과 같은 날짜는 예약 시각으로 보고 제외(오인 방지) ② `bc-netlog.js` 이용권 응답 탐지기 추가 — 바디코디 페이지가 받는 서버 응답 중 잔여/만료/유효 키가 있는 것의 요청 주소·키 이름·날짜 값만 기록(개인정보 미기록)하여, 예약 데이터에 유효기간이 없을 때 로그(`📡`)만으로 실제 출처를 파악 가능
 - v1.13.0 — **설명 자동 라인 확장**: 구글 캘린더 일정 설명에 `프로그램명 / 유효기간 / 총횟수 / 잔여횟수` 4줄을 고정 순서로 기록 (값이 있는 항목만). 유효기간은 바디코디 예약 데이터의 만료일 필드(후보 이름 + 날짜형 휴리스틱)에서 읽고, 시작일도 있으면 `시작 ~ 만료`로 표기. 어떤 필드에서 읽었는지 로그(`📆`)에 남기며, 못 찾으면 날짜형 필드 후보를 로그에 출력. 사용자가 직접 적은 메모는 기존과 동일하게 보존
 - v1.12.1 — **결과 화면 가독성 개선**: 동기화 결과를 JSON 대신 사람이 읽는 형태로 표시하고, 조치가 필요 없는 "이미 동기화됨"은 건수만 요약. 실패 → 시간이동 → 제목/설명 업데이트 → 건너뜀 순으로 분류. "최근 로그"는 기본으로 접히고 필요할 때 펼쳐서 확인
