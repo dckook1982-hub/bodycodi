@@ -243,15 +243,20 @@ async function extractSchedulesFromBodyCodi() {
           'serviceStartDate','service_start_date','membershipStartDate','membership_start_date',
           'periodStartDate','period_start_date','startDt','start_dt'
         ];
-        const EVENT_TIME_KEYS = new Set(['start_date','end_date','start','end']);
+        // 예약 시각 자체를 뜻하는 키 (start_date/end_date는 dhtmlx 표준, 나머지는 BodyCodi 원본일 가능성 대비)
+        const EVENT_TIME_KEYS = new Set(['start_date','end_date','start','end','startTime','endTime','start_time','end_time']);
 
-        // 날짜형 값 → "YYYY-MM-DD" (Date 객체, "2026-12-31", "2026.12.31", "20261231", "2026-12-31 23:59:59" 허용)
+        // 날짜형 값 → "YYYY-MM-DD"
+        //   허용: Date 객체, "2026-12-31", "2026.12.31", "20261231", "2026-12-31 23:59:59", epoch(ms/초) 숫자
         const toYmd = (v) => {
           if (v === null || v === undefined || v === '') return null;
-          if (v instanceof Date) {
-            if (isNaN(v.getTime())) return null;
-            const p = n => String(n).padStart(2, '0');
-            return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())}`;
+          const p = n => String(n).padStart(2, '0');
+          const fromDate = (d) => isNaN(d.getTime()) ? null : `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+          if (v instanceof Date) return fromDate(v);
+          if (typeof v === 'number') {
+            if (v > 1e12 && v < 4e12) return fromDate(new Date(v));          // epoch ms
+            if (v > 1e9  && v < 4e9)  return fromDate(new Date(v * 1000));   // epoch 초
+            return null;
           }
           const s = String(v).trim();
           const m = s.match(/^(\d{4})[-.\/]?(\d{2})[-.\/]?(\d{2})(?:[T\s].*)?$/);
@@ -260,17 +265,43 @@ async function extractSchedulesFromBodyCodi() {
           if (y < 2000 || y > 2100 || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
           return `${m[1]}-${m[2]}-${m[3]}`;
         };
+
+        // 객체 1단계 중첩까지 평탄화: { a:1, svc:{ endDate:'..' } } → [['a',1], ['svc.endDate','..']]
+        //   배열이면 첫 원소(객체)만 본다 (예: services[0])
+        const flatEntries = (ev) => {
+          const out = [];
+          for (const k of Object.keys(ev)) {
+            const v = ev[k];
+            out.push([k, v]);
+            const inner = Array.isArray(v) ? v[0] : v;
+            if (inner && typeof inner === 'object' && !(inner instanceof Date)) {
+              for (const ik of Object.keys(inner)) out.push([`${k}.${ik}`, inner[ik]]);
+            }
+          }
+          return out;
+        };
+        const lastSeg = (k) => k.split('.').pop();
+
         // 1) 알려진 후보 키 → 2) 키 이름에 end/expire/limit/valid 등이 들어가고 값이 날짜형인 필드(휴리스틱)
-        const getDateField = (ev, candidates, heuristicRe) => {
-          for (const k of candidates) {
-            if (!(k in ev)) continue;
-            const ymdv = toYmd(ev[k]);
+        //   excludeYmd: 예약 당일과 같은 날짜는 예약 시각 필드의 변형으로 보고 제외 (오인 방지)
+        const getDateField = (ev, candidates, heuristicRe, excludeYmd) => {
+          const entries = flatEntries(ev);
+          const ok = (k, v) => {
+            if (EVENT_TIME_KEYS.has(lastSeg(k))) return null;
+            const ymdv = toYmd(v);
+            if (!ymdv || excludeYmd.has(ymdv)) return null;
+            return ymdv;
+          };
+          const candSet = new Set(candidates);
+          for (const [k, v] of entries) {
+            if (!candSet.has(lastSeg(k))) continue;
+            const ymdv = ok(k, v);
             if (ymdv) return { value: ymdv, key: k };
           }
           if (heuristicRe) {
-            for (const k of Object.keys(ev)) {
-              if (EVENT_TIME_KEYS.has(k) || !heuristicRe.test(k)) continue;
-              const ymdv = toYmd(ev[k]);
+            for (const [k, v] of entries) {
+              if (!heuristicRe.test(lastSeg(k))) continue;
+              const ymdv = ok(k, v);
               if (ymdv) return { value: ymdv, key: k };
             }
           }
@@ -401,16 +432,18 @@ async function extractSchedulesFromBodyCodi() {
           }
 
           // ⭐ v1.13.0: 이용권 유효기간 (만료일 필수, 시작일은 있으면 "시작 ~ 만료"로 표기)
-          const expire = getDateField(ev, EXPIRE_KEYS, /(end|expir|limit|valid|deadline|만료|종료)/i);
+          //   예약 당일 날짜는 후보에서 제외 (예약 시각 필드가 다른 이름으로 중복 실려 오는 경우 오인 방지)
+          const eventDays = new Set([toYmd(ev.start_date), toYmd(ev.end_date)].filter(Boolean));
+          const expire = getDateField(ev, EXPIRE_KEYS, /(end|expir|limit|valid|deadline|만료|종료)/i, eventDays);
           const vstart = expire.value
-            ? getDateField(ev, VALID_START_KEYS, /(start|begin|시작)/i)
+            ? getDateField(ev, VALID_START_KEYS, /(start|begin|시작)/i, eventDays)
             : { value: null, key: null };
           let validPeriod = null;
           if (expire.value) {
             validPeriod = vstart.value ? `${vstart.value} ~ ${expire.value}` : expire.value;
           }
 
-          // 진단: 첫 이벤트의 모든 키 + 숫자 필드 + 날짜형 필드 dump
+          // 진단: 첫 이벤트의 모든 키 + 숫자 필드 + 날짜형 필드(중첩 1단계 포함) dump
           if (idx === 0) {
             _firstEventKeys = Object.keys(ev).sort();
             _firstEventNumericFields = {};
@@ -419,7 +452,11 @@ async function extractSchedulesFromBodyCodi() {
               const v = ev[k];
               if (typeof v === 'number' && Number.isFinite(v)) _firstEventNumericFields[k] = v;
               else if (typeof v === 'string' && /^-?\d+$/.test(v.trim()) && v.length < 12) _firstEventNumericFields[k] = '"'+v+'"';
-              if (!EVENT_TIME_KEYS.has(k) && toYmd(v)) _firstEventDateLikeFields[k] = toYmd(v);
+            }
+            for (const [k, v] of flatEntries(ev)) {
+              if (EVENT_TIME_KEYS.has(lastSeg(k))) continue;
+              const ymdv = toYmd(v);
+              if (ymdv) _firstEventDateLikeFields[k] = ymdv;
             }
           }
           _countDiscovery.total++;
@@ -502,6 +539,35 @@ async function extractSchedulesFromBodyCodi() {
     throw new Error(result?.error || 'extract failed');
   }
   return result.payload;
+}
+
+// ⭐ v1.13.1: bc-netlog.js 가 모아둔 "이용권 정보로 보이는 서버 응답" 목록 읽기
+//   (예약 데이터에 유효기간이 없을 때, 어느 요청이 유효기간을 주는지 로그로 파악하기 위함)
+async function readNetLogFromBodyCodi() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://crm.bodycodi.com/*' });
+    if (!tabs.length) return [];
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tabs[0].id },
+      world: 'MAIN',
+      func: () => {
+        const log = window.__bcNetLog;
+        if (!Array.isArray(log)) return null;   // 탐지기 미설치 (페이지가 확장 설치 전에 열림)
+        // URL 기준 중복 제거 후 최신 8건만
+        const seen = new Set(); const out = [];
+        for (const e of log) {
+          const key = `${e.method} ${e.url}`;
+          if (seen.has(key)) continue;
+          seen.add(key); out.push(e);
+          if (out.length >= 8) break;
+        }
+        return out;
+      }
+    });
+    return results?.[0]?.result;
+  } catch (e) {
+    return [];
+  }
 }
 
 // 고객 예약이 아닌 항목 필터 (기타스케줄 등)
@@ -627,6 +693,18 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     } else {
       // 못 찾았을 때 첫 이벤트의 날짜형 필드를 모두 출력 → 실제 필드명 파악용
       await appendLog(`📆 유효기간 추출: 0/${x.total || 0} — 날짜형 필드 후보: ${JSON.stringify(_diagnostics.firstEventDateLikeFields || {})}`);
+      // ⭐ v1.13.1: 예약 데이터에 없으면 바디코디 서버 응답 중 이용권 정보로 보이는 것을 기록
+      const net = await readNetLogFromBodyCodi();
+      if (net === null) {
+        await appendLog(`📡 이용권 응답 탐지기 미작동 — 바디코디 탭을 새로고침한 뒤 회원 상세(이용권) 화면을 한 번 열고 다시 동기화해 주세요`);
+      } else if (!net.length) {
+        await appendLog(`📡 이용권 정보로 보이는 서버 응답 없음 — 바디코디에서 회원 상세(이용권) 화면을 한 번 연 뒤 다시 동기화하면 기록됩니다`);
+      } else {
+        for (const e of net) {
+          const hits = Object.fromEntries(e.hits.slice(0, 12));
+          await appendLog(`📡 ${e.method} ${e.url} → ${JSON.stringify(hits)}`);
+        }
+      }
     }
     const a = _diagnostics.assessDiscovery || {};
     if (a.count > 0) {
