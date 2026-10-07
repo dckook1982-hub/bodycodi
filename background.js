@@ -1,7 +1,7 @@
 // ================================================
 // BodyCodi → Google Calendar Sync
 // background.js
-// - 2주(이번 주 일요일 ~ 다음 주 토요일) 전체 동기화
+// - v1.15.0: 4주(이번 주 일요일 ~ 3주 뒤 토요일) 전체 동기화 (SYNC_WEEKS 상수로 조절)
 // - 제목 포맷: "회원번호 성함 연락처 프로그램이름" (회원번호 없으면 생략)
 // - 설명 자동 라인(v1.13.0): "프로그램명 / 유효기간 / 총횟수 / 잔여횟수" (사용자 메모는 보존)
 // - v1.14.0: 예약이 옮겨지면 회원번호로 캘린더의 옛 일정을 찾아 새 시각으로 이동, 짝이 없으면 새로 생성
@@ -11,21 +11,24 @@
 
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 
+// ⭐ v1.15.0: 동기화 주 수 (이번 주 포함). 바디코디 화면을 이 수만큼 주 단위로 넘기며 예약을 읽는다
+const SYNC_WEEKS = 4;
+
 // ---------- 유틸 ----------
 function ymd(d) {
   const p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-// 동기화 범위: 이번 주 일요일 00:00 ~ 다음 주 토요일 23:59:59.999 (총 14일)
-function getSyncRange(date) {
+// 동기화 범위: 이번 주 일요일 00:00 ~ (SYNC_WEEKS주 뒤) 토요일 23:59:59.999 (총 SYNC_WEEKS×7일)
+function getSyncRange(date, weeks = SYNC_WEEKS) {
   const d = new Date(date);
   const day = d.getDay(); // 0=일, 6=토
   const start = new Date(d);
   start.setDate(d.getDate() - day);     // 이번 주 일요일
   start.setHours(0, 0, 0, 0);
   const end = new Date(start);
-  end.setDate(start.getDate() + 13);    // 일요일 + 13일 = 다음 주 토요일
+  end.setDate(start.getDate() + weeks * 7 - 1);   // 일요일 + (7×주 − 1)일 = 마지막 주 토요일
   end.setHours(23, 59, 59, 999);
   return { rangeStart: start, rangeEnd: end };
 }
@@ -175,11 +178,13 @@ async function extractSchedulesFromBodyCodi() {
   const results = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     world: 'MAIN',
-    func: async () => {
+    args: [SYNC_WEEKS],
+    func: async (SYNC_WEEKS_ARG) => {
       try {
         if (typeof scheduler === 'undefined' || typeof scheduler.getEvents !== 'function') {
           return { ok: false, error: 'scheduler 객체 없음' };
         }
+        const WEEKS = Math.max(1, Number(SYNC_WEEKS_ARG) || 2);
 
         // 강사명 매핑 (select 옵션에서 파싱)
         const coachNameMap = {};
@@ -202,8 +207,9 @@ async function extractSchedulesFromBodyCodi() {
           coachNames.add(clean.replace(/(쌤|강사|선생님?)$/, ''));
         }
 
-        // === 2주 프리페치: 다음 주로 이동 → 데이터 로드 → 원위치 복원 → 두 주 이벤트 병합 ===
-        const fetchTwoWeeksEvents = async () => {
+        // === ⭐ v1.15.0: N주 프리페치: 다음 주, 그다음 주 … 로 차례로 이동 → 데이터 로드 → 원위치 복원 → 병합 ===
+        //   (v1.7.0의 2주 프리페치를 주 수 가변으로 확장. 주당 약 2.5초 소요)
+        const fetchWeeksEvents = async (weeks) => {
           const WAIT_MS = 2500;
           let origDate = null, origMode = 'week';
 
@@ -215,21 +221,24 @@ async function extractSchedulesFromBodyCodi() {
 
           // setCurrentView 없으면 prefetch 불가 — 그냥 현재 이벤트 리턴
           if (!origDate || typeof scheduler.setCurrentView !== 'function') {
-            return { events: scheduler.getEvents(), prefetched: false };
+            return { events: scheduler.getEvents(), prefetched: false, weekCounts: [scheduler.getEvents().length] };
           }
 
           // 현재 주의 이벤트 수집
-          const week1Events = scheduler.getEvents().slice();
+          const all = [scheduler.getEvents().slice()];
 
-          // 다음 주로 이동
-          let week2Events = [];
-          try {
-            const nextWeek = new Date(origDate);
-            nextWeek.setDate(nextWeek.getDate() + 7);
-            scheduler.setCurrentView(nextWeek, origMode);
-            await new Promise(r => setTimeout(r, WAIT_MS));
-            week2Events = scheduler.getEvents().slice();
-          } catch (e) { /* navigation 실패 */ }
+          // 다음 주부터 차례로 이동하며 수집
+          for (let w = 1; w < weeks; w++) {
+            let weekEvents = [];
+            try {
+              const target = new Date(origDate);
+              target.setDate(target.getDate() + 7 * w);
+              scheduler.setCurrentView(target, origMode);
+              await new Promise(r => setTimeout(r, WAIT_MS));
+              weekEvents = scheduler.getEvents().slice();
+            } catch (e) { /* navigation 실패 — 이 주는 비움 */ }
+            all.push(weekEvents);
+          }
 
           // 원위치 복원
           try {
@@ -240,14 +249,14 @@ async function extractSchedulesFromBodyCodi() {
           // id 기준 dedup 병합
           const seen = new Set();
           const merged = [];
-          for (const ev of week1Events.concat(week2Events)) {
+          for (const ev of all.flat()) {
             const id = String(ev.id || ev.seq_schedule || '');
             if (id && !seen.has(id)) { seen.add(id); merged.push(ev); }
           }
-          return { events: merged, prefetched: true, week1: week1Events.length, week2: week2Events.length };
+          return { events: merged, prefetched: true, weekCounts: all.map(a => a.length) };
         };
 
-        const _prefetch = await fetchTwoWeeksEvents();
+        const _prefetch = await fetchWeeksEvents(WEEKS);
         const events = _prefetch.events;
         const toIso = (d) => {
           if (!d || !(d instanceof Date)) return String(d || '');
@@ -563,8 +572,8 @@ async function extractSchedulesFromBodyCodi() {
               assessDiscovery: _assessDiscovery,
               prefetch: {
                 attempted: _prefetch.prefetched,
-                week1Count: _prefetch.week1 || 0,
-                week2Count: _prefetch.week2 || 0
+                weeks: WEEKS,
+                weekCounts: _prefetch.weekCounts || []
               }
             }
           }
@@ -720,9 +729,10 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   if (_diagnostics) {
     const pf = _diagnostics.prefetch || {};
     if (pf.attempted) {
-      await appendLog(`🔁 2주 프리페치: 1주차=${pf.week1Count}건, 2주차=${pf.week2Count}건 (병합 후 ${events.length}건)`);
+      const perWeek = (pf.weekCounts || []).map((n, i) => `${i + 1}주차=${n}건`).join(', ');
+      await appendLog(`🔁 ${SYNC_WEEKS}주 프리페치: ${perWeek} (병합 후 ${events.length}건)`);
     } else {
-      await appendLog(`⚠️ 2주 프리페치 미시도 — scheduler.setCurrentView 사용 불가. 현재 보이는 주만 동기화됩니다.`);
+      await appendLog(`⚠️ ${SYNC_WEEKS}주 프리페치 미시도 — scheduler.setCurrentView 사용 불가. 현재 보이는 주만 동기화됩니다.`);
     }
     const d = _diagnostics.countDiscovery || {};
     await appendLog(`🔬 횟수 추출: 총횟수발견=${d.withTotal||0}/${d.total||0}, 잔여횟수발견=${d.withRemain||0}/${d.total||0}`);
@@ -761,7 +771,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
 
   const { rangeStart, rangeEnd } = getSyncRange(new Date());
-  await appendLog(`📅 동기화 범위 (2주): ${ymd(rangeStart)} ~ ${ymd(rangeEnd)}`);
+  await appendLog(`📅 동기화 범위 (${SYNC_WEEKS}주): ${ymd(rangeStart)} ~ ${ymd(rangeEnd)}`);
 
   // 동기화 범위 + 고객 예약만
   const rangeEvents = events.filter(ev => {
@@ -770,7 +780,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     if (t < rangeStart.getTime() || t > rangeEnd.getTime()) return false;
     return isCustomerBooking(ev);
   });
-  await appendLog(`📅 2주 고객 예약: ${rangeEvents.length}건`);
+  await appendLog(`📅 ${SYNC_WEEKS}주 고객 예약: ${rangeEvents.length}건`);
 
   // coachId 별 그룹
   const byCoach = {};
@@ -890,7 +900,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     }
 
     // ⭐ v1.14.0: 바디코디에는 없는데 캘린더에 남아 있는 고객 일정(취소·범위 밖 이동 등) → 보고만 (삭제하지 않음)
-    //   2주 프리페치가 실패했으면 다음 주 예약이 통째로 비어 보이므로 오탐 방지를 위해 건너뜀
+    //   주 단위 프리페치가 실패했으면 다음 주 이후 예약이 통째로 비어 보이므로 오탐 방지를 위해 건너뜀
     if (prefetchOk) {
       for (const g of gcalEvents) {
         if (claimed.has(g.id) || !g.start?.dateTime) continue;
