@@ -4,6 +4,7 @@
 // - 2주(이번 주 일요일 ~ 다음 주 토요일) 전체 동기화
 // - 제목 포맷: "회원번호 성함 연락처 프로그램이름" (회원번호 없으면 생략)
 // - 설명 자동 라인(v1.13.0): "프로그램명 / 유효기간 / 총횟수 / 잔여횟수" (사용자 메모는 보존)
+// - v1.14.0: 예약이 옮겨지면 회원번호로 캘린더의 옛 일정을 찾아 새 시각으로 이동, 짝이 없으면 새로 생성
 // - v1.9.0: 평가 프로그램(담당쌤 동작기능평가/대표원장 관절기능평가)은 "N회차"를 제목 끝에 보존
 // - popup.js의 __bcPopup 메시지 구조에 맞춤
 // ================================================
@@ -119,6 +120,46 @@ async function patchEvent(token, calendarId, eventId, body) {
     `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     { method: 'PATCH', body: JSON.stringify(body) }
   );
+}
+
+// ⭐ v1.14.0: 캘린더 일정 생성
+async function insertEvent(token, calendarId, body) {
+  return gcalFetch(
+    token,
+    `/calendars/${encodeURIComponent(calendarId)}/events`,
+    { method: 'POST', body: JSON.stringify(body) }
+  );
+}
+
+// ---------- ⭐ v1.14.0: 회원 식별 (캘린더 제목 ↔ 바디코디 예약) ----------
+// 제목에서 회원번호(예: 26-073) 추출 — 전화번호 일부가 걸리지 않도록 경계 조건
+function memberNoInTitle(title) {
+  const m = String(title || '').match(/(?<![\d-])(\d{2}-\d{3})(?!\d)/);
+  return m ? m[1] : '';
+}
+function phoneDigits(s) {
+  const m = String(s || '').match(/01[016789][-\s]?\d{3,4}[-\s]?\d{4}/);
+  return m ? m[0].replace(/\D/g, '') : '';
+}
+// 회원 키: 회원번호가 있으면 "no:26-073", 없으면 "np:이름|01012345678"
+function memberKeyOfBc(bc) {
+  if (bc.memberNo) return `no:${bc.memberNo}`;
+  const ph = phoneDigits(bc.phone);
+  if (bc.memberName && ph) return `np:${bc.memberName}|${ph}`;
+  return '';
+}
+function memberKeyOfGcal(g) {
+  const title = g.summary || '';
+  const no = memberNoInTitle(title);
+  if (no) return `no:${no}`;
+  const ph = phoneDigits(title);
+  const nm = title.match(/([가-힣]{2,12})/);
+  if (nm && ph) return `np:${nm[1]}|${ph}`;
+  return '';
+}
+// 캘린더 일정이 "고객 예약"으로 보이는지 (마커가 있거나 제목에 회원번호/이름+연락처)
+function isCustomerGcalEvent(g) {
+  return !!(g.extendedProperties?.private?.bcSyncId) || !!memberKeyOfGcal(g);
 }
 
 // ---------- BodyCodi 탭에서 스케줄 추출 ----------
@@ -744,10 +785,16 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     matched: 0,
     updated: 0,
     timeMoved: 0,     // ⭐ v1.12.0: 시간이 이동된 일정 수
+    created: 0,       // ⭐ v1.14.0: 새로 만든 캘린더 일정 수
     skipped: 0,
     failed: 0,
-    details: []
+    details: [],
+    orphans: []       // ⭐ v1.14.0: 바디코디에 없는 캘린더 고객 일정 (보고용)
   };
+
+  // ⭐ v1.14.0: 설정 — 짝 없는 예약을 캘린더에 새로 만들지 (기본 켬)
+  const { createMissing = true } = await chrome.storage.local.get('createMissing');
+  const prefetchOk = !!(_diagnostics?.prefetch?.attempted);
 
   // 진행률 계산: 25% ~ 95% 구간(70%)을 이벤트 처리 진척으로 나눔
   const totalToProcess = rangeEvents.length;
@@ -784,9 +831,11 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     }
     await appendLog(`📖 coach=${coachId} → ${calendarId}: GCal ${gcalEvents.length}건`);
 
-    // ⭐ v1.12.0: 매칭을 2단계로 분리 + 이미 매칭된 캘린더 일정은 재사용 금지(claimed)
+    // ⭐ v1.12.0: 매칭을 단계로 분리 + 이미 매칭된 캘린더 일정은 재사용 금지(claimed)
     //   1차) bcSyncId 마커/레거시 태그 — 시간이 바뀌어도 "같은 예약"으로 추적됨 (시간 이동의 핵심)
-    //   2차) 시간 ±3분 — 아직 마커가 없는 최초 동기화 건
+    //   2차) 시간 ±3분 — 아직 마커가 없는 최초 동기화 건 (⭐ v1.14.0: 제목에 다른 회원번호가 있으면 제외)
+    //   3차) ⭐ v1.14.0: 회원번호 기준 — 바디코디에서 예약을 옮겨 예약번호가 바뀌거나 마커가 없던 경우,
+    //        캘린더에 남아 있는 같은 회원의 "짝 잃은" 일정을 찾아 새 시각으로 옮긴다
     //   2단계로 나누는 이유: 시간매칭이 먼저 캘린더 일정을 선점해버리면,
     //   정작 마커로 확정 매칭돼야 할 예약이 짝을 잃고 시간 이동에 실패함
     const matchByIdx = new Map();
@@ -808,10 +857,47 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       const m = gcalEvents.find(g => {
         if (claimed.has(g.id)) return false;
         const gs = tsOf(g.start?.dateTime || g.start?.date);
-        return gs !== null && Math.abs(gs - bcStart) <= 3 * 60 * 1000;
+        if (gs === null || Math.abs(gs - bcStart) > 3 * 60 * 1000) return false;
+        // 같은 시각이어도 제목에 "다른 회원번호"가 박혀 있으면 남의 일정 → 매칭 금지
+        const gNo = memberNoInTitle(g.summary);
+        return !gNo || !bc.memberNo || gNo === bc.memberNo;
       });
       if (m) { matchByIdx.set(i, m); claimed.add(m.id); }
     });
+
+    // 3차) 회원번호(또는 이름+연락처)로 짝 잃은 캘린더 일정 재사용 → 시간 이동
+    //   같은 회원의 미매칭 예약이 여럿이면 시간순으로 1:1 짝지음
+    {
+      const unmatchedByKey = {};
+      evs.forEach((bc, i) => {
+        if (matchByIdx.has(i)) return;
+        const key = memberKeyOfBc(bc);
+        if (!key) return;
+        (unmatchedByKey[key] ||= []).push(i);
+      });
+      for (const [key, idxs] of Object.entries(unmatchedByKey)) {
+        const cands = gcalEvents
+          .filter(g => !claimed.has(g.id) && memberKeyOfGcal(g) === key)
+          .sort((a, b) => (tsOf(a.start?.dateTime) || 0) - (tsOf(b.start?.dateTime) || 0));
+        if (!cands.length) continue;
+        idxs.sort((a, b) => (tsOf(evs[a].start) || 0) - (tsOf(evs[b].start) || 0));
+        for (let k = 0; k < idxs.length && k < cands.length; k++) {
+          matchByIdx.set(idxs[k], cands[k]);
+          claimed.add(cands[k].id);
+          await appendLog(`🔁 ${key.replace(/^(no|np):/, '').replace(/\|.*/, '')}: 캘린더의 짝 잃은 일정(${hhmm(cands[k].start?.dateTime)})을 바디코디 예약(${hhmm(evs[idxs[k]].start)})에 연결`);
+        }
+      }
+    }
+
+    // ⭐ v1.14.0: 바디코디에는 없는데 캘린더에 남아 있는 고객 일정(취소·범위 밖 이동 등) → 보고만 (삭제하지 않음)
+    //   2주 프리페치가 실패했으면 다음 주 예약이 통째로 비어 보이므로 오탐 방지를 위해 건너뜀
+    if (prefetchOk) {
+      for (const g of gcalEvents) {
+        if (claimed.has(g.id) || !g.start?.dateTime) continue;
+        if (!isCustomerGcalEvent(g)) continue;
+        summary.orphans.push({ 캘린더: coachName, 시작: g.start.dateTime, 제목: g.summary || '(제목 없음)' });
+      }
+    }
 
     for (const [idx, bc] of evs.entries()) {
       // 진행률: 매 이벤트 시작 시 카운터 증가 (어떤 분기로 빠지든 진행 보장)
@@ -822,18 +908,78 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       const newTitle = buildTitle(bc);
       if (!newTitle) { summary.skipped++; continue; }
 
-      // 매칭 결과는 위의 2단계 패스에서 이미 확정됨
+      // 매칭 결과는 위의 3단계 패스에서 이미 확정됨
       const match = matchByIdx.get(idx);
 
       if (!match) {
-        summary.skipped++;
-        summary.details.push({
-          시작: bc.start,
-          회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-          프로그램: bc.program,
-          매칭: false,
-          변경예정: false
-        });
+        // ⭐ v1.14.0: 짝이 없으면 캘린더에 새로 만든다 (설정으로 끌 수 있음)
+        if (!createMissing) {
+          summary.skipped++;
+          summary.details.push({
+            시작: bc.start,
+            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
+            프로그램: bc.program,
+            매칭: false,
+            변경예정: false
+          });
+          continue;
+        }
+
+        let createTitle = newTitle;
+        if (bc.isAssessment && !/회차/.test(createTitle) && bc.round !== null && bc.round !== undefined) {
+          createTitle = `${createTitle} ${bc.round}회차`;
+        }
+        const startTs = tsOf(bc.start);
+        let endIso = bc.end;
+        if (startTs === null) { summary.skipped++; continue; }
+        if (tsOf(endIso) === null || tsOf(endIso) <= startTs) {
+          endIso = new Date(startTs + 60 * 60 * 1000).toISOString();   // 종료 없으면 1시간
+        }
+
+        if (dryRun) {
+          summary.details.push({
+            시작: bc.start,
+            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
+            프로그램: bc.program,
+            매칭: false,
+            변경예정: true,
+            생성: true,
+            새제목: createTitle
+          });
+          continue;
+        }
+
+        try {
+          await insertEvent(token, calendarId, {
+            summary: createTitle,
+            description: buildDescription(bc, ''),
+            start: { dateTime: bc.start, timeZone: 'Asia/Seoul' },
+            end:   { dateTime: endIso,   timeZone: 'Asia/Seoul' },
+            extendedProperties: { private: { bcSyncId: bc.id } }
+          });
+          summary.created++;
+          summary.details.push({
+            시작: bc.start,
+            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
+            프로그램: bc.program,
+            매칭: false,
+            변경예정: true,
+            완료: true,
+            생성: true,
+            새제목: createTitle
+          });
+          await appendLog(`🆕 ${memberLabel}: 캘린더 일정 생성 ${hhmm(bc.start)} "${createTitle}"`);
+        } catch (err) {
+          summary.failed++;
+          await appendLog(`❌ 생성 실패: ${err.message}`);
+          summary.details.push({
+            시작: bc.start,
+            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
+            프로그램: bc.program,
+            매칭: false,
+            실패: err.message
+          });
+        }
         continue;
       }
 
@@ -987,9 +1133,12 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
 
   const alreadyOkCount = (summary.details || []).filter(d => d.사유 === '이미 동기화됨').length;
+  if (summary.orphans.length) {
+    await appendLog(`📍 바디코디에 없는 캘린더 고객 일정 ${summary.orphans.length}건 (삭제하지 않음, 팝업 결과에서 확인)`);
+  }
   await appendLog(
     `✅ 완료 v${version} trig=${trigger} dry=${dryRun} ` +
-    `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
+    `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 생성=${summary.created} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
   );
   reportProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
   return { summary };
