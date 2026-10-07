@@ -183,7 +183,7 @@ function renderResult(details, dryRun, orphans) {
   addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀 (새로 만들기 꺼짐)', skipped, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
 
-  addSection('📍', '바디코디에 없는 캘린더 일정 — 취소됐거나 2주 밖으로 옮겨진 건일 수 있음 (삭제하지 않음, 확인 필요)', orphanList, d =>
+  addSection('📍', '바디코디에 없는 캘린더 일정 — 취소됐거나 4주 밖으로 옮겨진 건일 수 있음 (삭제하지 않음, 확인 필요)', orphanList, d =>
     `   · ${fmtWhen(d.시작)}  ${d.제목 || ''}  [${d.캘린더 || ''}]`);
 
   if (alreadyOk > 0) out.push(`✅ 이미 동기화됨 — ${alreadyOk}건 (표시 생략)`);
@@ -192,7 +192,7 @@ function renderResult(details, dryRun, orphans) {
 }
 
 function runSync(dryRun) {
-  setStatus(dryRun ? '🔍 미리보기 실행 중... (2주: 이번 주+다음 주)' : '🔄 동기화 중... (2주: 이번 주+다음 주)');
+  setStatus(dryRun ? '🔍 미리보기 실행 중... (4주: 이번 주+3주, 약 10초)' : '🔄 동기화 중... (4주: 이번 주+3주)');
   document.getElementById('resultBox').textContent = '';
   showProgress(0, '시작 중...');
 
