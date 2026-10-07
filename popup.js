@@ -15,6 +15,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   await refreshOnboarding();
   loadLogsAndResult();
+
+  // ⭐ v1.14.0: "짝 없는 예약 새로 만들기" 설정 (기본 켬)
+  try {
+    const { createMissing = true } = await chrome.storage.local.get('createMissing');
+    const cb = document.getElementById('createMissing');
+    cb.checked = !!createMissing;
+    cb.addEventListener('change', () => chrome.storage.local.set({ createMissing: cb.checked }));
+  } catch (e) { /* ignore */ }
 });
 
 // ---------- 강사 ↔ 캘린더 자동 추천 ----------
@@ -136,17 +144,19 @@ function fmtWhen(iso) {
   return `${d.getMonth() + 1}/${d.getDate()}(${W[d.getDay()]}) ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-function renderResult(details, dryRun) {
+function renderResult(details, dryRun, orphans) {
   const list = details || [];
 
   const failed  = list.filter(d => d.실패);
+  const created = list.filter(d => d.생성 && !d.실패);
   const moved   = list.filter(d => d.시간이동 && !d.실패);
-  const updated = list.filter(d => !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
-  const skipped = list.filter(d => d.매칭 === false);
+  const updated = list.filter(d => !d.생성 && !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
+  const skipped = list.filter(d => d.매칭 === false && !d.생성 && !d.실패);
 
-  const alreadyOk = list.length - failed.length - moved.length - updated.length - skipped.length;
+  const alreadyOk = list.length - failed.length - created.length - moved.length - updated.length - skipped.length;
+  const orphanList = orphans || [];
 
-  if (!failed.length && !moved.length && !updated.length && !skipped.length) {
+  if (!failed.length && !created.length && !moved.length && !updated.length && !skipped.length && !orphanList.length) {
     return `✅ 조치가 필요한 항목이 없습니다.\n   (${alreadyOk}건 모두 이미 동기화된 상태)`;
   }
 
@@ -164,11 +174,17 @@ function renderResult(details, dryRun) {
   addSection('🕒', dryRun ? '시간 이동 예정' : '시간 이동됨', moved, d =>
     `   · ${(d.회원 || '').trim()}  ${d.프로그램 || ''}\n     ${d.시간이동}`);
 
+  addSection('🆕', dryRun ? '캘린더에 새로 만들 예정' : '캘린더에 새로 만듦', created, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.새제목 || ''}`);
+
   addSection('✏️', dryRun ? '제목/설명 변경 예정' : '제목/설명 업데이트됨', updated, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.새제목 || ''}`);
 
-  addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀', skipped, d =>
+  addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀 (새로 만들기 꺼짐)', skipped, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
+
+  addSection('📍', '바디코디에 없는 캘린더 일정 — 취소됐거나 2주 밖으로 옮겨진 건일 수 있음 (삭제하지 않음, 확인 필요)', orphanList, d =>
+    `   · ${fmtWhen(d.시작)}  ${d.제목 || ''}  [${d.캘린더 || ''}]`);
 
   if (alreadyOk > 0) out.push(`✅ 이미 동기화됨 — ${alreadyOk}건 (표시 생략)`);
 
@@ -199,18 +215,22 @@ function runSync(dryRun) {
       ? (s.details || []).filter(d => d.시간이동).length
       : (s.timeMoved || 0);
     const movedText = movedCount > 0 ? ` · 🕒시간이동=${movedCount}` : '';
+    const createdCount = dryRun
+      ? (s.details || []).filter(d => d.생성).length
+      : (s.created || 0);
+    const createdText = createdCount > 0 ? ` · 🆕생성=${createdCount}` : '';
 
     setStatus(
       dryRun
-        ? `🔍 미리보기 완료 | 매칭=${s.matched} · 변경예정=${changedCount}${movedText}`
-        : `✅ 완료 | 매칭=${s.matched} · 업데이트=${s.updated}${movedText} · 스킵=${s.skipped} · 실패=${s.failed}`
+        ? `🔍 미리보기 완료 | 매칭=${s.matched} · 변경예정=${changedCount}${movedText}${createdText}`
+        : `✅ 완료 | 매칭=${s.matched} · 업데이트=${s.updated}${movedText}${createdText} · 스킵=${s.skipped} · 실패=${s.failed}`
     );
 
     // 100% 잠깐 보여주고 자연스럽게 숨김
     showProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
     setTimeout(hideProgress, 1500);
 
-    document.getElementById('resultBox').textContent = renderResult(s.details, dryRun);
+    document.getElementById('resultBox').textContent = renderResult(s.details, dryRun, s.orphans);
 
     loadLogsAndResult();
   });
