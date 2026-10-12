@@ -11,11 +11,31 @@
 // 동작: fetch / XMLHttpRequest 응답을 가로채 window.__bcNetLog 에 최근 60건을 보관.
 //       background.js 가 동기화 때 이 목록을 읽어 📡 로그로 남긴다.
 // 주의: 페이지 동작 자체는 바꾸지 않는다 (응답은 그대로 통과).
+// ⭐ v1.16.0: 요청 시작·완료 시각도 기록 → 동기화가 "화면을 넘긴 뒤 시작된 데이터 요청이
+//   모두 끝났는지"(window.__bcNetActivity(since))를 보고 판단한다. 고정 2.5초 대기보다 정확하고,
+//   알림 확인처럼 오래 열려 있는 요청이 있어도 그 이후에 시작된 요청만 보므로 막히지 않는다.
 // ================================================
 (() => {
   if (window.__bcNetLog) return;
 
   const LOG = [];
+  const inflight = new Map();   // 요청번호 → 시작 시각
+  const recentStarts = [];      // 최근 요청 시작 시각 (최대 100개)
+  let reqSeq = 0, lastEnd = 0;
+  const netStart = () => {
+    const id = ++reqSeq, t = Date.now();
+    inflight.set(id, t);
+    recentStarts.push(t); if (recentStarts.length > 100) recentStarts.shift();
+    return id;
+  };
+  const netEnd = (id) => { if (inflight.delete(id)) lastEnd = Date.now(); };
+  // since 이후에 시작된 요청: 진행 중 개수 / 시작된 개수 / 마지막 완료 시각
+  window.__bcNetActivity = (since) => {
+    let busy = 0;
+    for (const t of inflight.values()) if (t >= since) busy++;
+    const started = recentStarts.filter(t => t >= since).length;
+    return { busy, started, lastEnd };
+  };
   const MAX_ENTRIES = 60;
   const MAX_HITS = 40;
   const KEY_RE  = /(remain|expir|valid|limit|deadline|period|만료|유효|종료|잔여)/i;
@@ -63,7 +83,10 @@
   const origFetch = window.fetch;
   if (typeof origFetch === 'function') {
     window.fetch = function (input, init) {
-      const p = origFetch.apply(this, arguments);
+      const rid = netStart();
+      let p;
+      try { p = origFetch.apply(this, arguments); } catch (e) { netEnd(rid); throw e; }
+      p.then(() => netEnd(rid), () => netEnd(rid));
       p.then(res => {
         try {
           const ct = res.headers.get('content-type') || '';
@@ -85,6 +108,8 @@
     return origOpen.apply(this, arguments);
   };
   XP.send = function () {
+    const rid = netStart();
+    this.addEventListener('loadend', () => netEnd(rid), { once: true });
     this.addEventListener('load', () => {
       try {
         let body = null;
@@ -93,7 +118,7 @@
         if (body) record(this.__bcUrl, this.__bcMethod, body);
       } catch (e) {}
     });
-    return origSend.apply(this, arguments);
+    try { return origSend.apply(this, arguments); } catch (e) { netEnd(rid); throw e; }
   };
 
   window.__bcNetLog = LOG;

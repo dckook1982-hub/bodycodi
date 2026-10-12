@@ -13,15 +13,18 @@
    - Google Drive MCP `create_file`로 올릴 때: 텍스트 파일은 `textContent`, PNG·BOM이 있는 `.ps1`은 `base64Content`. **반드시 `disableConversionToGoogleType: true`** (빠뜨리면 PNG가 Google 문서로 변환된다).
    - 업로드 후 응답의 `fileSize`가 로컬 바이트 수(`wc -c`)와 같은지 전부 확인한다.
 6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
+7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다. 첫 업로드만 `store/MAKE-STORE-ZIP.bat`(개인키 포함)을 쓴다. 웹스토어 ID가 다르게 나오면 OAuth 클라이언트 ID가 바뀌므로 스토어용 ZIP의 `oauth2.client_id`만 교체한다.
 
 ## 절대 하지 말 것
 
 - `manifest.json`의 `key` 필드를 바꾸지 않는다 (Extension ID 고정용). `.pem`은 저장소에 넣지 않는다.
-- 구글 캘린더 일정을 **삭제**하는 코드를 넣지 않는다. 바디코디에 없는 일정은 📍로 보고만 한다.
+- 구글 캘린더 일정을 **삭제**하는 코드를 넣지 않는다. 취소·사라진 예약은 `[취소]`·회색·한가함으로 **표시만** 하고(되살아나면 복구), 확장이 만든 적 없는(마커 없는) 일정은 📍로 보고만 한다.
+- 자동 동기화가 오래된 탭 데이터로 실행되게 하지 않는다 (여러 PC가 서로 덮어씀). 최신 데이터는 동기화 전용 새 탭에서 읽는다.
 - 모델명·세션 식별자를 커밋 메시지나 코드에 적지 않는다.
 
 ## 구조 메모
 
-- `background.js`: 동기화 본체. `SYNC_WEEKS`(기본 4)가 범위. 매칭은 ① 예약번호 마커 ② 시간 ±3분(다른 회원번호면 제외) ③ 회원번호 기준 짝 잃은 일정 재사용 순. 짝 없으면 생성(`createMissing` 설정).
+- `background.js`: 동기화 본체. `SYNC_WEEKS`(기본 4)가 범위. 바디코디는 `openFreshBodyCodiTab`이 연 새 탭에서 읽는다(화면 단위로 넘기며 `bc-netlog`의 요청 완료를 기다림). 모든 매핑 캘린더를 먼저 조회한 뒤 매칭 계획 → 실행. 매칭은 ① 같은 캘린더 예약번호 마커 ② 다른 캘린더 마커(강사 변경 → `events.move`) ③ 시간 ±3분(다른 회원번호면 제외) ④ 회원번호 기준 짝 잃은 일정 재사용. 짝 없으면 생성(`createMissing`). 취소 상태·사라진 예약은 `[취소]` 표시. 자동 주기는 `syncIntervalMin`(15~1440분, 평일 09~21시) 하나의 `sync-next` 알람.
+- 검증 스크립트(채팅 세션 scratchpad에 있었음): chrome/fetch 모킹 runSync 시뮬레이션 + 실제 Chromium에 확장을 올려 가짜 바디코디·가짜 캘린더 API(HTTPS, host-resolver-rules)로 끝까지 실행.
 - `bc-netlog.js`: 바디코디 페이지의 서버 응답에서 이용권 유효기간 후보 필드만 기록하는 탐지기 (개인정보 미기록).
 - `AUTO-UPDATE.ps1` / `.vbs`, `SETUP-PERMANENT.ps1`, `INSTALL.bat`, `UNINSTALL.bat`: Windows 배포. `.ps1`은 UTF-8 BOM 필수.
