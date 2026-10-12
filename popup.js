@@ -23,7 +23,65 @@ document.addEventListener('DOMContentLoaded', async () => {
     cb.checked = !!createMissing;
     cb.addEventListener('change', () => chrome.storage.local.set({ createMissing: cb.checked }));
   } catch (e) { /* ignore */ }
+
+  // ⭐ v1.16.0: 자동 동기화 주기 (기본 1시간)
+  try {
+    const { syncIntervalMin = 60 } = await chrome.storage.local.get('syncIntervalMin');
+    const sel = document.getElementById('syncInterval');
+    if ([...sel.options].some(o => Number(o.value) === Number(syncIntervalMin))) {
+      sel.value = String(syncIntervalMin);
+    }
+    sel.addEventListener('change', async () => {
+      await chrome.storage.local.set({ syncIntervalMin: Number(sel.value) });
+      // background가 다음 실행 시각을 다시 거는 동안 잠깐 기다렸다가 표시
+      setTimeout(refreshScheduleInfo, 400);
+    });
+  } catch (e) { /* ignore */ }
+  refreshScheduleInfo();
 });
+
+// ---------- 다음 자동 동기화 시각 표시 ----------
+async function refreshScheduleInfo() {
+  const el = document.getElementById('scheduleInfo');
+  if (!el) return;
+  try {
+    const alarm = await chrome.alarms.get('sync-next');
+    const label = document.getElementById('syncInterval').selectedOptions[0]?.textContent.replace('⏱ ', '') || '';
+    el.textContent = alarm
+      ? `⏱ 자동 동기화: 평일 09~21시 ${label} · 다음 ${fmtWhen(new Date(alarm.scheduledTime).toISOString())}`
+      : `⏱ 자동 동기화: 평일 09~21시 ${label}`;
+  } catch (e) {
+    el.textContent = '';
+  }
+}
+
+// ---------- 적용 내용 접기/펼치기 (기본: 접힘) ----------
+function setResultOpen(open) {
+  document.getElementById('resultBox').classList.toggle('hidden', !open);
+  document.getElementById('toggleResult').textContent = open ? '▼ 접기' : '▶ 펼치기';
+}
+document.getElementById('toggleResult').addEventListener('click', () => {
+  setResultOpen(document.getElementById('resultBox').classList.contains('hidden'));
+});
+
+function showResult(details, dryRun, orphans) {
+  const list = details || [];
+  const actionCount =
+    list.filter(d => d.사유 !== '이미 동기화됨' && (d.실패 || d.생성 || d.시간이동 || d.취소 || d.강사이동 ||
+      d.매칭 === false || d.완료 || (dryRun && d.변경예정))).length + (orphans || []).length;
+  document.getElementById('resultBox').textContent = renderResult(details, dryRun, orphans);
+  document.getElementById('resultTitle').textContent = actionCount > 0
+    ? `📝 ${dryRun ? '바뀔 내용' : '적용 내용'} ${actionCount}건`
+    : '📝 조치가 필요한 항목 없음';
+  document.getElementById('resultHead').classList.remove('hidden');
+  setResultOpen(false);
+}
+
+function clearResult() {
+  document.getElementById('resultBox').textContent = '';
+  document.getElementById('resultHead').classList.add('hidden');
+  setResultOpen(false);
+}
 
 // ---------- 강사 ↔ 캘린더 자동 추천 ----------
 // 정규화: 괄호 부분 / 흔한 접미사 / 공백 제거
@@ -147,16 +205,20 @@ function fmtWhen(iso) {
 function renderResult(details, dryRun, orphans) {
   const list = details || [];
 
-  const failed  = list.filter(d => d.실패);
-  const created = list.filter(d => d.생성 && !d.실패);
-  const moved   = list.filter(d => d.시간이동 && !d.실패);
-  const updated = list.filter(d => !d.생성 && !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
-  const skipped = list.filter(d => d.매칭 === false && !d.생성 && !d.실패);
+  const failed    = list.filter(d => d.실패);
+  const cancelled = list.filter(d => d.취소 && !d.실패);                         // ⭐ v1.16.0
+  const coachMv   = list.filter(d => d.강사이동 && !d.취소 && !d.실패);           // ⭐ v1.16.0
+  const restored  = list.filter(d => d.복구 && !d.강사이동 && !d.취소 && !d.실패); // ⭐ v1.16.0
+  const rest      = list.filter(d => !d.취소 && !d.강사이동 && !d.복구);
+  const created = rest.filter(d => d.생성 && !d.실패);
+  const moved   = rest.filter(d => d.시간이동 && !d.실패);
+  const updated = rest.filter(d => !d.생성 && !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
+  const skipped = rest.filter(d => d.매칭 === false && !d.생성 && !d.실패);
 
-  const alreadyOk = list.length - failed.length - created.length - moved.length - updated.length - skipped.length;
+  const alreadyOk = list.filter(d => d.사유 === '이미 동기화됨').length;
   const orphanList = orphans || [];
 
-  if (!failed.length && !created.length && !moved.length && !updated.length && !skipped.length && !orphanList.length) {
+  if (!failed.length && !cancelled.length && !coachMv.length && !restored.length && !created.length && !moved.length && !updated.length && !skipped.length && !orphanList.length) {
     return `✅ 조치가 필요한 항목이 없습니다.\n   (${alreadyOk}건 모두 이미 동기화된 상태)`;
   }
 
@@ -171,6 +233,15 @@ function renderResult(details, dryRun, orphans) {
   addSection('❌', '실패', failed, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.실패}`);
 
+  addSection('🚫', dryRun ? '취소로 표시할 예정 (삭제하지 않음)' : '취소로 표시함 — 제목 앞 [취소], 회색 (삭제하지 않음)', cancelled, d =>
+    `   · ${fmtWhen(d.시작)}  ${d.회원 || ''}\n     ${d.취소}${d.캘린더 ? ` [${d.캘린더}]` : ''}`);
+
+  addSection('🔀', dryRun ? '담당 강사 변경 — 캘린더 옮길 예정' : '담당 강사 변경 — 캘린더 옮김', coachMv, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.강사이동}${d.시간이동 ? ` · ${d.시간이동}` : ''}`);
+
+  addSection('♻️', dryRun ? '다시 살아난 예약 — [취소] 해제 예정' : '다시 살아난 예약 — [취소] 해제함', restored, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}${d.시간이동 ? `\n     ${d.시간이동}` : ''}`);
+
   addSection('🕒', dryRun ? '시간 이동 예정' : '시간 이동됨', moved, d =>
     `   · ${(d.회원 || '').trim()}  ${d.프로그램 || ''}\n     ${d.시간이동}`);
 
@@ -183,7 +254,7 @@ function renderResult(details, dryRun, orphans) {
   addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀 (새로 만들기 꺼짐)', skipped, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
 
-  addSection('📍', '바디코디에 없는 캘린더 일정 — 취소됐거나 4주 밖으로 옮겨진 건일 수 있음 (삭제하지 않음, 확인 필요)', orphanList, d =>
+  addSection('📍', '바디코디 예약과 연결되지 않은 고객 일정 — 직접 만든 일정일 수 있음 (그대로 둠, 확인 필요)', orphanList, d =>
     `   · ${fmtWhen(d.시작)}  ${d.제목 || ''}  [${d.캘린더 || ''}]`);
 
   if (alreadyOk > 0) out.push(`✅ 이미 동기화됨 — ${alreadyOk}건 (표시 생략)`);
@@ -192,8 +263,8 @@ function renderResult(details, dryRun, orphans) {
 }
 
 function runSync(dryRun) {
-  setStatus(dryRun ? '🔍 미리보기 실행 중... (4주: 이번 주+3주, 약 10초)' : '🔄 동기화 중... (4주: 이번 주+3주)');
-  document.getElementById('resultBox').textContent = '';
+  setStatus(dryRun ? '🔍 미리보기 실행 중... (바디코디 최신 화면을 새 탭으로 읽는 중, 약 15초)' : '🔄 동기화 중... (바디코디 최신 화면을 새 탭으로 읽는 중, 약 15초)');
+  clearResult();
   showProgress(0, '시작 중...');
 
   chrome.runtime.sendMessage({ __bcPopup: 'runSync', dryRun }, (resp) => {
@@ -219,18 +290,21 @@ function runSync(dryRun) {
       ? (s.details || []).filter(d => d.생성).length
       : (s.created || 0);
     const createdText = createdCount > 0 ? ` · 🆕생성=${createdCount}` : '';
+    const cancelCount = dryRun ? (s.details || []).filter(d => d.취소).length : (s.cancelled || 0);
+    const coachMvCount = dryRun ? (s.details || []).filter(d => d.강사이동).length : (s.calMoved || 0);
+    const extraText = (cancelCount ? ` · 🚫취소=${cancelCount}` : '') + (coachMvCount ? ` · 🔀강사변경=${coachMvCount}` : '');
 
     setStatus(
       dryRun
-        ? `🔍 미리보기 완료 | 매칭=${s.matched} · 변경예정=${changedCount}${movedText}${createdText}`
-        : `✅ 완료 | 매칭=${s.matched} · 업데이트=${s.updated}${movedText}${createdText} · 스킵=${s.skipped} · 실패=${s.failed}`
+        ? `🔍 미리보기 완료 | 매칭=${s.matched} · 변경예정=${changedCount}${movedText}${createdText}${extraText}`
+        : `✅ 완료 | 매칭=${s.matched} · 업데이트=${s.updated}${movedText}${createdText}${extraText} · 스킵=${s.skipped} · 실패=${s.failed}`
     );
 
     // 100% 잠깐 보여주고 자연스럽게 숨김
     showProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
     setTimeout(hideProgress, 1500);
 
-    document.getElementById('resultBox').textContent = renderResult(s.details, dryRun, s.orphans);
+    showResult(s.details, dryRun, s.orphans);
 
     loadLogsAndResult();
   });

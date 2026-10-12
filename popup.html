@@ -72,8 +72,23 @@
       white-space: pre-wrap;
       word-break: break-all;
     }
-    #resultBox { max-height: 260px; line-height: 1.5; }
+    #resultBox { max-height: 260px; line-height: 1.5; margin-top: 4px; }
     #resultBox:empty { display: none; }
+
+    /* ⭐ v1.16.0: 자동 동기화 주기 드롭다운 */
+    #syncInterval {
+      padding: 6px 4px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    #scheduleInfo { font-size: 11px; color: #5f6368; margin: 0 0 6px; }
+
+    /* ⭐ v1.16.0: 적용 내용은 접어 두고, 펼칠 때만 보기 */
+    #resultHead { margin: 4px 0 0; }
+    #resultHead h4 { font-size: 12px; font-weight: 500; color: #3c4043; }
     #logs { max-height: 280px; }
 
     /* 섹션 헤더 + 토글 버튼 */
@@ -182,7 +197,7 @@
       <li id="step3">강사별 캘린더 선택 → <b>"매핑 저장"</b></li>
     </ol>
     <div class="hint">
-      ※ 매핑 저장 후에는 매일 09시·13시·17시 자동 동기화됩니다.<br>
+      ※ 매핑 저장 후에는 평일 09~21시에 자동 동기화됩니다 (주기는 아래 드롭다운에서 선택).<br>
       ※ "지금 동기화" 버튼으로 즉시 실행도 가능합니다.
     </div>
     <span class="open-btn" id="openBodyCodiBtn">→ 바디코디 스케줄 페이지 열기</span>
@@ -190,8 +205,20 @@
 
   <div class="btn-row">
     <button class="primary" id="syncNow">▶ 지금 동기화</button>
+    <select id="syncInterval" title="자동 동기화 주기 (평일 09~21시)">
+      <option value="15">⏱ 15분마다</option>
+      <option value="30">⏱ 30분마다</option>
+      <option value="45">⏱ 45분마다</option>
+      <option value="60" selected>⏱ 1시간마다</option>
+      <option value="120">⏱ 2시간마다</option>
+      <option value="180">⏱ 3시간마다</option>
+      <option value="360">⏱ 6시간마다</option>
+      <option value="720">⏱ 12시간마다</option>
+      <option value="1440">⏱ 24시간마다</option>
+    </select>
     <button id="dryRun">🔍 미리보기</button>
   </div>
+  <div id="scheduleInfo"></div>
 
   <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#444;margin:2px 0 6px;cursor:pointer;">
     <input type="checkbox" id="createMissing" checked>
@@ -207,7 +234,11 @@
     <div id="progressLabel"></div>
   </div>
 
-  <pre id="resultBox"></pre>
+  <div id="resultHead" class="section-head hidden">
+    <h4 id="resultTitle">📝 적용 내용</h4>
+    <button id="toggleResult" class="mini">▶ 펼치기</button>
+  </div>
+  <pre id="resultBox" class="hidden"></pre>
 
   <hr>
 

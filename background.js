@@ -108,7 +108,7 @@ async function listEventsInRange(token, calendarId, timeMin, timeMax) {
     orderBy: 'startTime',
     maxResults: '2500',
     // extendedProperties는 fields 미지정 시 기본 응답에 포함됨 — 명시적으로 보장
-    fields: 'items(id,summary,description,start,end,extendedProperties)'
+    fields: 'items(id,summary,description,start,end,extendedProperties,colorId,transparency)'
   });
   const data = await gcalFetch(
     token,
@@ -132,6 +132,25 @@ async function insertEvent(token, calendarId, body) {
     `/calendars/${encodeURIComponent(calendarId)}/events`,
     { method: 'POST', body: JSON.stringify(body) }
   );
+}
+
+// ⭐ v1.16.0: 담당 강사가 바뀐 예약의 일정을 다른 캘린더로 옮긴다 (삭제·재생성 아님)
+async function moveEventToCalendar(token, fromCalendarId, eventId, toCalendarId) {
+  return gcalFetch(
+    token,
+    `/calendars/${encodeURIComponent(fromCalendarId)}/events/${encodeURIComponent(eventId)}/move?destination=${encodeURIComponent(toCalendarId)}`,
+    { method: 'POST' }
+  );
+}
+
+// ⭐ v1.16.0: 취소된 예약 표시 (일정은 지우지 않는다)
+const CANCEL_PREFIX = '[취소] ';
+const CANCEL_COLOR_ID = '8';   // 구글 캘린더 "흑연(회색)"
+function stripCancelPrefix(title) {
+  return String(title || '').replace(/^\s*\[취소\]\s*/, '');
+}
+function isCancelMarked(g) {
+  return g?.extendedProperties?.private?.bcCancelled === '1' || /^\s*\[취소\]/.test(g?.summary || '');
 }
 
 // ---------- ⭐ v1.14.0: 회원 식별 (캘린더 제목 ↔ 바디코디 예약) ----------
@@ -165,21 +184,86 @@ function isCustomerGcalEvent(g) {
   return !!(g.extendedProperties?.private?.bcSyncId) || !!memberKeyOfGcal(g);
 }
 
-// ---------- BodyCodi 탭에서 스케줄 추출 ----------
-async function extractSchedulesFromBodyCodi() {
-  const tabs = await chrome.tabs.query({
-    url: 'https://crm.bodycodi.com/manager/schedule/*',
-  });
-  if (!tabs.length) {
-    throw new Error('BodyCodi 스케줄 탭이 열려있지 않습니다.');
-  }
-  const tab = tabs[0];
+// ---------- ⭐ v1.16.0: 최신 데이터를 읽기 위한 "동기화 전용 탭" ----------
+// 원인: 이미 열려 있는 바디코디 탭의 scheduler 데이터는 그 탭을 연 시점(몇 시간 전일 수 있음)의 것이다.
+//       다른 직원·다른 PC·회원 앱에서 생긴 예약/취소/이동은 그 탭을 새로고침하기 전까지 보이지 않는다.
+// 해결: 동기화할 때마다 바디코디 스케줄 화면을 백그라운드 새 탭으로 열어(로그인 세션 공유)
+//       서버에서 막 받은 데이터를 읽고, 끝나면 탭을 닫는다. 사용자가 보고 있는 탭은 건드리지 않는다.
+const BODYCODI_SCHEDULE_URL = 'https://crm.bodycodi.com/manager/schedule/promise';
+const BC_SCHEDULE_PATTERN = 'https://crm.bodycodi.com/manager/schedule/*';
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function findBodyCodiTab() {
+  const tabs = await chrome.tabs.query({ url: BC_SCHEDULE_PATTERN });
+  return tabs[0] || null;
+}
+
+// 새 탭을 열고 scheduler가 준비될 때까지 기다린다. 실패하면 탭을 닫고 이유를 던진다.
+async function openFreshBodyCodiTab(baseTab) {
+  let url = BODYCODI_SCHEDULE_URL;
+  if (baseTab?.url && baseTab.url.startsWith('https://crm.bodycodi.com/manager/schedule/')) {
+    url = baseTab.url.split('#')[0];
+  }
+  let tab;
+  try {
+    tab = await chrome.tabs.create({
+      url, active: false,
+      ...(baseTab ? { windowId: baseTab.windowId, index: baseTab.index + 1 } : {})
+    });
+  } catch (e) {
+    // 일반 창이 하나도 없을 때 (크롬이 백그라운드로만 실행 중)
+    const win = await chrome.windows.create({ url, focused: false, state: 'minimized' });
+    tab = win.tabs[0];
+  }
+
+  const deadline = Date.now() + 40000;
+  let readyAt = 0;
+  try {
+    while (Date.now() < deadline) {
+      await sleep(700);
+      let r = null;
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          world: 'MAIN',
+          func: () => {
+            const ready = typeof scheduler !== 'undefined' && typeof scheduler.getEvents === 'function' &&
+                          !!(scheduler.getState && scheduler.getState().date);
+            // 최근 15초 안에 시작된 요청만 본다 (오래 열려 있는 알림 요청 등은 무시)
+            const a = typeof window.__bcNetActivity === 'function' ? window.__bcNetActivity(Date.now() - 15000) : null;
+            return { href: location.href, ready, busy: a ? a.busy : -1, quietMs: a ? Date.now() - (a.lastEnd || 0) : -1 };
+          }
+        });
+        r = res?.[0]?.result;
+      } catch (e) { /* 아직 로딩 중 */ }
+      if (!r) continue;
+      if (!/\/manager\/schedule\//.test(r.href)) {
+        throw new Error('바디코디 스케줄 화면이 열리지 않음 (로그인이 필요할 수 있음)');
+      }
+      // 준비 조건: scheduler 생성 + 첫 데이터 요청까지 끝남 (요청 추적이 안 되거나 8초가 지나면 그냥 진행)
+      if (r.ready) {
+        readyAt ||= Date.now();
+        if (r.busy === -1 || (r.busy === 0 && r.quietMs >= 800) || Date.now() - readyAt > 8000) {
+          return tab.id;
+        }
+      }
+    }
+    throw new Error('바디코디 스케줄 화면 로딩 시간 초과 (40초)');
+  } catch (e) {
+    try { await chrome.tabs.remove(tab.id); } catch (_) {}
+    throw e;
+  }
+}
+
+// ---------- BodyCodi 탭에서 스케줄 추출 ----------
+//   tabId: 읽을 탭, rangeStart/rangeEnd: 동기화 범위, restoreView: 사용자 탭이면 화면을 원래대로 돌려놓음
+async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, restoreView = false }) {
   const results = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     world: 'MAIN',
-    args: [SYNC_WEEKS],
-    func: async (SYNC_WEEKS_ARG) => {
+    args: [SYNC_WEEKS, rangeStart.getTime(), rangeEnd.getTime(), !!restoreView],
+    func: async (SYNC_WEEKS_ARG, RANGE_START_MS, RANGE_END_MS, RESTORE_VIEW) => {
       try {
         if (typeof scheduler === 'undefined' || typeof scheduler.getEvents !== 'function') {
           return { ok: false, error: 'scheduler 객체 없음' };
@@ -207,56 +291,128 @@ async function extractSchedulesFromBodyCodi() {
           coachNames.add(clean.replace(/(쌤|강사|선생님?)$/, ''));
         }
 
-        // === ⭐ v1.15.0: N주 프리페치: 다음 주, 그다음 주 … 로 차례로 이동 → 데이터 로드 → 원위치 복원 → 병합 ===
-        //   (v1.7.0의 2주 프리페치를 주 수 가변으로 확장. 주당 약 2.5초 소요)
-        const fetchWeeksEvents = async (weeks) => {
-          const WAIT_MS = 2500;
-          let origDate = null, origMode = 'week';
+        // === ⭐ v1.16.0: 범위 전체를 화면 단위로 차례로 읽기 ===
+        //   - 동기화 범위 첫날부터 시작해, 화면이 보여 주는 구간(state.min_date ~ max_date) 단위로 넘어간다.
+        //     (주 시작이 일요일이든 월요일이든, 일/주/월 보기든 빈틈없이 덮인다)
+        //   - 화면을 넘길 때마다 바디코디의 데이터 요청이 끝날 때까지 기다린다 (bc-netlog 요청 카운터).
+        //     카운터가 없으면 예전처럼 2.5초 고정 대기.
+        //   - 각 화면에서는 그 화면 구간에 시작하는 예약만 취한다 → 다른 주의 묵은 캐시가 섞이지 않음.
+        const DAY = 86400000;
+        // navStart: 화면을 넘기기 직전 시각. 그 뒤에 시작된 요청만 기다린다.
+        const settle = async (navStart) => {
+          await new Promise(r => setTimeout(r, 450));
+          if (typeof window.__bcNetActivity !== 'function') {
+            await new Promise(r => setTimeout(r, 2050));
+            return 'fixed';
+          }
+          while (Date.now() - navStart < 10000) {
+            const a = window.__bcNetActivity(navStart);
+            if (a.busy === 0) {
+              // 요청이 하나도 없었으면(캐시로 그림) 0.9초, 있었으면 마지막 완료 후 0.5초 더 기다림
+              if (a.started === 0 ? Date.now() - navStart >= 900 : Date.now() - a.lastEnd >= 500) return 'net';
+            }
+            await new Promise(r => setTimeout(r, 150));
+          }
+          return 'timeout';
+        };
+        const evStartMs = (ev) => {
+          const t = ev.start_date instanceof Date ? ev.start_date.getTime() : new Date(ev.start_date).getTime();
+          return Number.isFinite(t) ? t : null;
+        };
+        const renderedIds = () => {
+          const ids = new Set();
+          document.querySelectorAll('[event_id],[data-event-id]').forEach(el => {
+            const v = el.getAttribute('event_id') || el.getAttribute('data-event-id');
+            if (v) ids.add(String(v));
+          });
+          return ids;
+        };
 
+        const fetchRangeEvents = async () => {
+          let origDate = null, origMode = 'week';
           try {
             const state = (scheduler.getState && scheduler.getState()) || {};
             origDate = state.date ? new Date(state.date) : null;
             origMode = state.mode || 'week';
-          } catch (e) { /* state 접근 실패 - 현재 이벤트만 사용 */ }
+          } catch (e) { /* state 접근 실패 */ }
 
-          // setCurrentView 없으면 prefetch 불가 — 그냥 현재 이벤트 리턴
           if (!origDate || typeof scheduler.setCurrentView !== 'function') {
-            return { events: scheduler.getEvents(), prefetched: false, weekCounts: [scheduler.getEvents().length] };
+            const evs = scheduler.getEvents();
+            return { events: evs, prefetched: false, complete: false, views: [], hiddenCount: 0, waitModes: [] };
           }
 
-          // 현재 주의 이벤트 수집
-          const all = [scheduler.getEvents().slice()];
-
-          // 다음 주부터 차례로 이동하며 수집
-          for (let w = 1; w < weeks; w++) {
-            let weekEvents = [];
+          // 사용자 탭에서 읽는 경우: 지금 보고 있는 주를 다시 받아오게 하려고 먼저 범위 밖으로 한 번 이동
+          if (RESTORE_VIEW) {
             try {
-              const target = new Date(origDate);
-              target.setDate(target.getDate() + 7 * w);
-              scheduler.setCurrentView(target, origMode);
-              await new Promise(r => setTimeout(r, WAIT_MS));
-              weekEvents = scheduler.getEvents().slice();
-            } catch (e) { /* navigation 실패 — 이 주는 비움 */ }
-            all.push(weekEvents);
+              const t = Date.now();
+              scheduler.setCurrentView(new Date(RANGE_END_MS + 7 * DAY), origMode);
+              await settle(t);
+            } catch (e) {}
           }
 
-          // 원위치 복원
-          try {
-            scheduler.setCurrentView(origDate, origMode);
-            await new Promise(r => setTimeout(r, 800));   // 짧게: 사용자 view 복원만
-          } catch (e) {}
-
-          // id 기준 dedup 병합
-          const seen = new Set();
-          const merged = [];
-          for (const ev of all.flat()) {
-            const id = String(ev.id || ev.seq_schedule || '');
-            if (id && !seen.has(id)) { seen.add(id); merged.push(ev); }
+          const byId = new Map();
+          const views = [];
+          const waitModes = [];
+          let hiddenCount = 0, domSeen = false;
+          let cursor = RANGE_START_MS;
+          let complete = false;
+          for (let guard = 0; guard < 45; guard++) {
+            if (cursor > RANGE_END_MS) { complete = true; break; }
+            let vmin = null, vmax = null, got = [];
+            try {
+              const navStart = Date.now();
+              scheduler.setCurrentView(new Date(cursor), origMode);
+              waitModes.push(await settle(navStart));
+              const st = scheduler.getState() || {};
+              vmin = st.min_date ? new Date(st.min_date).getTime() : null;
+              vmax = st.max_date ? new Date(st.max_date).getTime() : null;
+              if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin || vmin > cursor || vmax <= cursor) {
+                const d = new Date(cursor); d.setHours(0, 0, 0, 0);
+                vmin = d.getTime(); vmax = vmin + 7 * DAY;
+              }
+              try { got = scheduler.getEvents(new Date(vmin), new Date(vmax)) || []; }
+              catch (e) { got = scheduler.getEvents() || []; }
+            } catch (e) {
+              views.push({ from: cursor, to: cursor, count: 0, error: String(e && e.message || e) });
+              break;   // 화면 이동 실패 → 범위 불완전
+            }
+            const shown = renderedIds();
+            if (shown.size) domSeen = true;
+            let n = 0;
+            for (const ev of got) {
+              const t = evStartMs(ev);
+              if (t === null || t < vmin || t >= vmax) continue;
+              const id = String(ev.id || ev.seq_schedule || '');
+              if (!id) continue;
+              byId.set(id, ev);
+              n++;
+              if (shown.size && !shown.has(String(ev.id))) { ev.__bcHidden = true; hiddenCount++; }
+            }
+            views.push({ from: vmin, to: vmax, count: n });
+            cursor = vmax;
           }
-          return { events: merged, prefetched: true, weekCounts: all.map(a => a.length) };
+
+          if (RESTORE_VIEW) {
+            try {
+              scheduler.setCurrentView(origDate, origMode);
+              await new Promise(r => setTimeout(r, 800));
+            } catch (e) {}
+          }
+          return {
+            events: Array.from(byId.values()), prefetched: true, complete, views,
+            hiddenCount: domSeen ? hiddenCount : null, waitModes
+          };
         };
 
-        const _prefetch = await fetchWeeksEvents(WEEKS);
+        const _prefetch = await fetchRangeEvents();
+        // 로그용: 동기화 주(일요일 시작)별 건수
+        const weekCounts = Array.from({ length: WEEKS }, () => 0);
+        for (const ev of _prefetch.events) {
+          const t = evStartMs(ev);
+          if (t === null || t < RANGE_START_MS || t > RANGE_END_MS) continue;
+          const w = Math.floor((t - RANGE_START_MS) / (7 * DAY));
+          if (w >= 0 && w < WEEKS) weekCounts[w]++;
+        }
         const events = _prefetch.events;
         const toIso = (d) => {
           if (!d || !(d instanceof Date)) return String(d || '');
@@ -365,6 +521,8 @@ async function extractSchedulesFromBodyCodi() {
         let _countDiscovery = { withTotal: 0, withRemain: 0, withBoth: 0, total: 0 };
         let _expireDiscovery = { withExpire: 0, withStart: 0, total: 0, expireKey: null, startKey: null };
         let _assessDiscovery = { count: 0, withMember: 0, withRound: 0, sampleText: null, sampleFields: null };
+        const _statusDist = {};      // ⭐ v1.16.0: 상태값 분포 (취소 표기 방식 파악용)
+        const _hiddenSamples = [];   // ⭐ v1.16.0: 데이터엔 있으나 화면에 안 그려진 예약 예시
 
         const result = events.map((ev, idx) => {
           const raw = String(ev.text || '').trim();
@@ -457,6 +615,34 @@ async function extractSchedulesFromBodyCodi() {
           }
 
           const coachId = String(ev.section_id || ev.coach_id || '');
+
+          // ⭐ v1.16.0: 예약 상태 — 취소 여부 판정
+          //   ① 상태 관련 필드(state/status/cancel/del 이 이름에 들어간 단순 값)에 "취소/cancel" 이 있거나
+          //      취소 플래그(cancel_yn=Y, is_cancel=true 등)가 켜져 있으면 취소
+          //   ② 화면 글자에 "취소" 가 단독 항목으로 들어 있으면 취소 (예: ".../ 취소", "[취소]")
+          //   노쇼·결석은 수업 횟수가 차감되는 "진행된 예약" 이므로 취소로 보지 않는다.
+          const statusPairs = [];
+          let cancelled = false;
+          for (const k of Object.keys(ev)) {
+            if (!/(state|status|cancel|del_?yn|is_?del)/i.test(k)) continue;
+            const v = ev[k];
+            if (v === null || v === undefined || typeof v === 'object' || typeof v === 'function') continue;
+            const sv = String(v).trim();
+            if (sv.length > 20) continue;
+            statusPairs.push(`${k}=${sv}`);
+            // 상태 필드의 값이 "취소/CANCEL..." 이면 취소 (cancel_reason 같은 설명 필드는 제외)
+            if (/(state|status)/i.test(k) && /취소|cancel/i.test(sv)) cancelled = true;
+            // 취소·삭제 여부 플래그 (cancel_yn, is_cancel, cancelled, del_yn, is_deleted ...)
+            //   cancelable / cancel_reason 같은 이름은 해당 없음
+            if (/^(is_?)?(cancel|cancell?ed|del|deleted)(_?(yn|flag))?$/i.test(k) && /^(y|true|1)$/i.test(sv)) cancelled = true;
+          }
+          if (parts.some(p => /^\[?\(?취소(됨)?\]?\)?$/.test(p)) || /\[취소\]|\(취소\)|예약\s*취소|취소된\s*예약/.test(raw)) {
+            cancelled = true;
+          }
+          statusPairs.forEach(sp => { _statusDist[sp] = (_statusDist[sp] || 0) + 1; });
+          if (ev.__bcHidden) {
+            _hiddenSamples.length < 3 && _hiddenSamples.push({ text: raw.slice(0, 24), status: statusPairs.join(',') });
+          }
 
           // 잔여횟수: BodyCodi의 remainNumber 필드
           const remainCount = getCountField(ev, REMAIN_KEYS);
@@ -554,7 +740,9 @@ async function extractSchedulesFromBodyCodi() {
             remainCount,
             validPeriod,
             isAssessment,
-            round
+            round,
+            cancelled,
+            hidden:      !!ev.__bcHidden
           };
         });
 
@@ -572,9 +760,15 @@ async function extractSchedulesFromBodyCodi() {
               assessDiscovery: _assessDiscovery,
               prefetch: {
                 attempted: _prefetch.prefetched,
+                complete: _prefetch.complete,
                 weeks: WEEKS,
-                weekCounts: _prefetch.weekCounts || []
-              }
+                weekCounts,
+                views: _prefetch.views,
+                waitModes: _prefetch.waitModes
+              },
+              statusDist: _statusDist,
+              hiddenCount: _prefetch.hiddenCount,
+              hiddenSamples: _hiddenSamples
             }
           }
         };
@@ -701,6 +895,10 @@ function buildDescription(ev, existingDescription) {
 // ---------- 메인 동기화 ----------
 async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   const version = chrome.runtime.getManifest().version;
+  // ⭐ v1.16.0: 동시 실행 방지 — 자동 동기화와 수동 실행이 겹치면 같은 예약이 두 번 생성될 수 있다
+  if (isSyncing) {
+    throw new Error('이미 동기화가 진행 중입니다. 끝난 뒤 다시 눌러 주세요.');
+  }
   isSyncing = true;   // 동기화 도중 자동 리로드가 끼어들지 않도록 잠금
   try {
   await appendLog(`▶ sync start v${version} (trigger=${trigger}, dryRun=${dryRun})`);
@@ -721,18 +919,54 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
   reportProgress(10, 'Google 인증 완료');
 
+  // ⭐ v1.16.0: 최신 데이터 확보 — 동기화 전용 새 탭에서 읽는다 (실패 시 수동 실행만 열린 탭으로 대체)
+  const { rangeStart, rangeEnd } = getSyncRange(new Date());
+  reportProgress(12, 'BodyCodi 최신 화면 여는 중');
+  const userTab = await findBodyCodiTab();
+  let freshTabId = null, readTabId = null;
+  try {
+    freshTabId = await openFreshBodyCodiTab(userTab);
+    readTabId = freshTabId;
+  } catch (e) {
+    await appendLog(`⚠️ 동기화용 새 탭을 열지 못함: ${e.message}`);
+    const isAuto = String(trigger).startsWith('alarm');
+    if (!userTab) {
+      throw new Error('바디코디 스케줄 화면을 열 수 없습니다. 크롬에서 바디코디에 로그인한 뒤 다시 시도해 주세요.');
+    }
+    if (isAuto) {
+      // 오래된 탭 데이터로 자동 동기화하면 다른 PC가 맞춰 둔 일정을 되돌릴 수 있어 건너뜀
+      throw new Error('자동 동기화 보류 — 최신 데이터를 읽을 수 없어 이번 회차는 건너뜁니다');
+    }
+    readTabId = userTab.id;
+  }
+  const freshOk = !!freshTabId;
+
   reportProgress(15, 'BodyCodi 일정 읽는 중');
-  const { events, _diagnostics } = await extractSchedulesFromBodyCodi();
-  await appendLog(`📥 BodyCodi 전체 이벤트: ${events.length}`);
+  let extracted;
+  try {
+    extracted = await extractSchedulesFromBodyCodi(readTabId, { rangeStart, rangeEnd, restoreView: !freshOk });
+  } finally {
+    if (freshTabId) { try { await chrome.tabs.remove(freshTabId); } catch (_) {} }
+  }
+  const { events, _diagnostics } = extracted;
+  await appendLog(`📥 BodyCodi 전체 이벤트: ${events.length} (출처: ${freshOk ? '새로 연 화면 — 최신' : '열려 있던 탭 — 최신이 아닐 수 있음'})`);
 
   // 진단 로그
+  const pf = _diagnostics?.prefetch || {};
   if (_diagnostics) {
-    const pf = _diagnostics.prefetch || {};
     if (pf.attempted) {
       const perWeek = (pf.weekCounts || []).map((n, i) => `${i + 1}주차=${n}건`).join(', ');
-      await appendLog(`🔁 ${SYNC_WEEKS}주 프리페치: ${perWeek} (병합 후 ${events.length}건)`);
+      const waits = (pf.waitModes || []);
+      const waitTxt = waits.includes('net') ? '요청완료 확인' : (waits.includes('fixed') ? '고정대기' : '-');
+      const toTxt = waits.filter(w => w === 'timeout').length;
+      await appendLog(`🔁 ${SYNC_WEEKS}주 프리페치: ${perWeek} (병합 후 ${events.length}건, 화면 ${(pf.views || []).length}개, 로딩=${waitTxt}${toTxt ? `, 시간초과 ${toTxt}회` : ''}${pf.complete ? '' : ', ⚠️범위 일부 못 읽음'})`);
     } else {
       await appendLog(`⚠️ ${SYNC_WEEKS}주 프리페치 미시도 — scheduler.setCurrentView 사용 불가. 현재 보이는 주만 동기화됩니다.`);
+    }
+    const sd = Object.entries(_diagnostics.statusDist || {}).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    if (sd.length) await appendLog(`📊 예약 상태값: ${sd.map(([k, n]) => `${k}×${n}`).join(', ')}`);
+    if (_diagnostics.hiddenCount) {
+      await appendLog(`👁 데이터에는 있으나 화면에 안 그려진 예약 ${_diagnostics.hiddenCount}건 — 예: ${JSON.stringify(_diagnostics.hiddenSamples || [])}`);
     }
     const d = _diagnostics.countDiscovery || {};
     await appendLog(`🔬 횟수 추출: 총횟수발견=${d.withTotal||0}/${d.total||0}, 잔여횟수발견=${d.withRemain||0}/${d.total||0}`);
@@ -742,9 +976,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       await appendLog(`📆 유효기간 추출: 만료일=${x.withExpire}/${x.total} (필드=${x.expireKey})` +
         ((x.withStart || 0) > 0 ? `, 시작일=${x.withStart}/${x.total} (필드=${x.startKey})` : ''));
     } else {
-      // 못 찾았을 때 첫 이벤트의 날짜형 필드를 모두 출력 → 실제 필드명 파악용
       await appendLog(`📆 유효기간 추출: 0/${x.total || 0} — 날짜형 필드 후보: ${JSON.stringify(_diagnostics.firstEventDateLikeFields || {})}`);
-      // ⭐ v1.13.1: 예약 데이터에 없으면 바디코디 서버 응답 중 이용권 정보로 보이는 것을 기록
       const net = await readNetLogFromBodyCodi();
       if (net === null) {
         await appendLog(`📡 이용권 응답 탐지기 미작동 — 바디코디 탭을 새로고침한 뒤 회원 상세(이용권) 화면을 한 번 열고 다시 동기화해 주세요`);
@@ -764,38 +996,36 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         await appendLog(`🩺 회원정보 미발견 이벤트 전체필드: ${JSON.stringify(a.sampleFields)}`);
       }
     }
-    if ((_diagnostics.countDiscovery.withRemain || 0) === 0 && _diagnostics.firstEventNumericFields) {
-      // 잔여횟수 못 찾았을 때 첫 이벤트 숫자 필드 출력 → 필드명 파악용
+    if (((_diagnostics.countDiscovery || {}).withRemain || 0) === 0 && _diagnostics.firstEventNumericFields) {
       await appendLog(`🔬 첫 이벤트 숫자필드(잔여횟수 찾기용): ${JSON.stringify(_diagnostics.firstEventNumericFields)}`);
     }
   }
 
-  const { rangeStart, rangeEnd } = getSyncRange(new Date());
   await appendLog(`📅 동기화 범위 (${SYNC_WEEKS}주): ${ymd(rangeStart)} ~ ${ymd(rangeEnd)}`);
 
-  // 동기화 범위 + 고객 예약만
+  // 바디코디에 존재하는 모든 예약번호 (범위·종류 무관) — "사라진 예약" 판정용
+  const allBcIds = new Set(events.map(e => e.id).filter(Boolean));
+
+  // 동기화 범위 + 고객 예약만, 진행(active) / 취소(cancelled) 분리
   const rangeEvents = events.filter(ev => {
     if (!ev.start) return false;
     const t = new Date(ev.start).getTime();
     if (t < rangeStart.getTime() || t > rangeEnd.getTime()) return false;
     return isCustomerBooking(ev);
   });
-  await appendLog(`📅 ${SYNC_WEEKS}주 고객 예약: ${rangeEvents.length}건`);
-
-  // coachId 별 그룹
-  const byCoach = {};
-  for (const ev of rangeEvents) {
-    if (!ev.coachId) continue;
-    (byCoach[ev.coachId] ||= []).push(ev);
-  }
-
-  reportProgress(25, `${rangeEvents.length}건 동기화 시작`);
+  const activeEvents    = rangeEvents.filter(ev => !ev.cancelled);
+  const cancelledEvents = rangeEvents.filter(ev => ev.cancelled);
+  const activeIds = new Set(activeEvents.map(e => e.id).filter(Boolean));
+  await appendLog(`📅 ${SYNC_WEEKS}주 고객 예약: ${activeEvents.length}건` + (cancelledEvents.length ? ` (+ 취소 ${cancelledEvents.length}건)` : ''));
 
   const summary = {
     matched: 0,
     updated: 0,
     timeMoved: 0,     // ⭐ v1.12.0: 시간이 이동된 일정 수
     created: 0,       // ⭐ v1.14.0: 새로 만든 캘린더 일정 수
+    cancelled: 0,     // ⭐ v1.16.0: [취소] 표시한 일정 수
+    restored: 0,      // ⭐ v1.16.0: [취소] 표시를 되돌린 일정 수
+    calMoved: 0,      // ⭐ v1.16.0: 담당 강사 변경으로 다른 캘린더로 옮긴 일정 수
     skipped: 0,
     failed: 0,
     details: [],
@@ -804,113 +1034,183 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
 
   // ⭐ v1.14.0: 설정 — 짝 없는 예약을 캘린더에 새로 만들지 (기본 켬)
   const { createMissing = true } = await chrome.storage.local.get('createMissing');
-  const prefetchOk = !!(_diagnostics?.prefetch?.attempted);
+  const coverageOk = !!(pf.attempted && pf.complete);
 
-  // 진행률 계산: 25% ~ 95% 구간(70%)을 이벤트 처리 진척으로 나눔
-  const totalToProcess = rangeEvents.length;
-  let processed = 0;
-  const progressBase = 25;
-  const progressSpan = 70;
-  const bumpProgress = (label) => {
-    if (totalToProcess === 0) return;
-    const pct = progressBase + (processed / totalToProcess) * progressSpan;
-    reportProgress(pct, label);
-  };
-
-  for (const [coachId, evs] of Object.entries(byCoach)) {
-    const calendarId = coachCalendarMap[coachId];
-    const coachName = evs[0]?.coachName || `coach=${coachId}`;
-    if (!calendarId) {
-      await appendLog(`⏭️ 매핑 없음: coachId=${coachId} (${evs.length}건)`);
-      summary.skipped += evs.length;
-      processed += evs.length;
-      bumpProgress(`매핑 없음 강사 ${evs.length}건 스킵`);
+  // ---------- 1단계: 캘린더별로 묶고, 모든 캘린더를 먼저 조회 ----------
+  //   (강사 변경으로 예약이 다른 캘린더로 옮겨진 경우를 찾으려면 전체를 한 번에 봐야 한다.
+  //    두 강사가 같은 캘린더를 쓰는 경우에도 한 묶음으로 처리되어 서로의 일정을 오판하지 않는다)
+  const byCal = new Map();   // calId → { active: [], cancelled: [], label }
+  for (const ev of rangeEvents) {
+    if (!ev.coachId) continue;
+    const calId = coachCalendarMap[ev.coachId];
+    if (!calId) {
+      if (!ev.cancelled) summary.skipped++;
       continue;
     }
+    if (!byCal.has(calId)) byCal.set(calId, { active: [], cancelled: [], label: ev.coachName || `coach=${ev.coachId}` });
+    byCal.get(calId)[ev.cancelled ? 'cancelled' : 'active'].push(ev);
+  }
+  const unmappedCoaches = [...new Set(activeEvents.filter(ev => ev.coachId && !coachCalendarMap[ev.coachId]).map(ev => ev.coachId))];
+  for (const cid of unmappedCoaches) {
+    await appendLog(`⏭️ 매핑 없음: coachId=${cid} (${activeEvents.filter(e => e.coachId === cid).length}건)`);
+  }
+  // 예약이 하나도 없는 매핑 캘린더도 조회해야 취소·사라짐을 반영할 수 있다
+  for (const calId of new Set(Object.values(coachCalendarMap))) {
+    if (!byCal.has(calId)) byCal.set(calId, { active: [], cancelled: [], label: calId });
+  }
 
-    bumpProgress(`${coachName} 캘린더 조회`);
-    let gcalEvents;
+  reportProgress(22, '구글 캘린더 조회 중');
+  const gcalByCal = new Map();
+  for (const [calId, grp] of byCal) {
     try {
-      gcalEvents = await listEventsInRange(token, calendarId, rangeStart, rangeEnd);
+      const list = await listEventsInRange(token, calId, rangeStart, rangeEnd);
+      gcalByCal.set(calId, list);
+      await appendLog(`📖 ${grp.label} → ${calId}: GCal ${list.length}건`);
     } catch (err) {
-      await appendLog(`❌ 캘린더 조회 실패 (${calendarId}): ${err.message}`);
-      summary.failed += evs.length;
-      processed += evs.length;
-      bumpProgress(`${coachName} 조회 실패`);
-      continue;
+      await appendLog(`❌ 캘린더 조회 실패 (${calId}): ${err.message}`);
+      summary.failed += grp.active.length;
+      byCal.delete(calId);
     }
-    await appendLog(`📖 coach=${coachId} → ${calendarId}: GCal ${gcalEvents.length}건`);
+  }
 
-    // ⭐ v1.12.0: 매칭을 단계로 분리 + 이미 매칭된 캘린더 일정은 재사용 금지(claimed)
-    //   1차) bcSyncId 마커/레거시 태그 — 시간이 바뀌어도 "같은 예약"으로 추적됨 (시간 이동의 핵심)
-    //   2차) 시간 ±3분 — 아직 마커가 없는 최초 동기화 건 (⭐ v1.14.0: 제목에 다른 회원번호가 있으면 제외)
-    //   3차) ⭐ v1.14.0: 회원번호 기준 — 바디코디에서 예약을 옮겨 예약번호가 바뀌거나 마커가 없던 경우,
-    //        캘린더에 남아 있는 같은 회원의 "짝 잃은" 일정을 찾아 새 시각으로 옮긴다
-    //   2단계로 나누는 이유: 시간매칭이 먼저 캘린더 일정을 선점해버리면,
-    //   정작 마커로 확정 매칭돼야 할 예약이 짝을 잃고 시간 이동에 실패함
-    const matchByIdx = new Map();
-    const claimed = new Set();
+  // ---------- 2단계: 매칭 계획 (모든 캘린더) ----------
+  const claimed = new Set();                  // `${calId}|${eventId}`
+  const ck = (calId, g) => `${calId}|${g.id}`;
+  const matchOf = new Map();                  // bc 객체 → { g, calId(원래 있던 캘린더) }
+  const markerIndex = new Map();              // bcSyncId → [{ calId, g }]
+  for (const [calId, list] of gcalByCal) {
+    for (const g of list) {
+      const sid = g.extendedProperties?.private?.bcSyncId;
+      if (sid) (markerIndex.get(sid) || markerIndex.set(sid, []).get(sid)).push({ calId, g });
+    }
+  }
+  const take = (bc, calId, g) => { matchOf.set(bc, { g, calId }); claimed.add(ck(calId, g)); };
 
-    evs.forEach((bc, i) => {
-      if (!bc.id) return;
+  // 1차) 같은 캘린더의 예약번호 마커 / 레거시 태그
+  for (const [calId, grp] of byCal) {
+    const list = gcalByCal.get(calId) || [];
+    for (const bc of grp.active) {
+      if (!bc.id) continue;
       const syncTag = `[bc-sync:${bc.id}]`;
       const m =
-        gcalEvents.find(g => !claimed.has(g.id) && g.extendedProperties?.private?.bcSyncId === bc.id) ||
-        gcalEvents.find(g => !claimed.has(g.id) && (g.description || '').includes(syncTag));
-      if (m) { matchByIdx.set(i, m); claimed.add(m.id); }
-    });
-
-    evs.forEach((bc, i) => {
-      if (matchByIdx.has(i)) return;
+        list.find(g => !claimed.has(ck(calId, g)) && g.extendedProperties?.private?.bcSyncId === bc.id) ||
+        list.find(g => !claimed.has(ck(calId, g)) && (g.description || '').includes(syncTag));
+      if (m) take(bc, calId, m);
+    }
+  }
+  // 1-2차) ⭐ v1.16.0: 다른 캘린더에 같은 예약번호 마커가 있으면 → 담당 강사가 바뀐 것 → 그 일정을 옮긴다
+  for (const [calId, grp] of byCal) {
+    for (const bc of grp.active) {
+      if (matchOf.has(bc) || !bc.id) continue;
+      const hit = (markerIndex.get(bc.id) || []).find(h => h.calId !== calId && !claimed.has(ck(h.calId, h.g)));
+      if (hit) take(bc, hit.calId, hit.g);
+    }
+  }
+  // 2차) 시간 ±3분 (같은 캘린더, 다른 회원번호가 박힌 일정은 제외)
+  for (const [calId, grp] of byCal) {
+    const list = gcalByCal.get(calId) || [];
+    for (const bc of grp.active) {
+      if (matchOf.has(bc)) continue;
       const bcStart = tsOf(bc.start);
-      if (bcStart === null) return;
-      const m = gcalEvents.find(g => {
-        if (claimed.has(g.id)) return false;
+      if (bcStart === null) continue;
+      const m = list.find(g => {
+        if (claimed.has(ck(calId, g))) return false;
         const gs = tsOf(g.start?.dateTime || g.start?.date);
         if (gs === null || Math.abs(gs - bcStart) > 3 * 60 * 1000) return false;
-        // 같은 시각이어도 제목에 "다른 회원번호"가 박혀 있으면 남의 일정 → 매칭 금지
         const gNo = memberNoInTitle(g.summary);
         return !gNo || !bc.memberNo || gNo === bc.memberNo;
       });
-      if (m) { matchByIdx.set(i, m); claimed.add(m.id); }
-    });
-
-    // 3차) 회원번호(또는 이름+연락처)로 짝 잃은 캘린더 일정 재사용 → 시간 이동
-    //   같은 회원의 미매칭 예약이 여럿이면 시간순으로 1:1 짝지음
-    {
-      const unmatchedByKey = {};
-      evs.forEach((bc, i) => {
-        if (matchByIdx.has(i)) return;
-        const key = memberKeyOfBc(bc);
-        if (!key) return;
-        (unmatchedByKey[key] ||= []).push(i);
-      });
-      for (const [key, idxs] of Object.entries(unmatchedByKey)) {
-        const cands = gcalEvents
-          .filter(g => !claimed.has(g.id) && memberKeyOfGcal(g) === key)
-          .sort((a, b) => (tsOf(a.start?.dateTime) || 0) - (tsOf(b.start?.dateTime) || 0));
-        if (!cands.length) continue;
-        idxs.sort((a, b) => (tsOf(evs[a].start) || 0) - (tsOf(evs[b].start) || 0));
-        for (let k = 0; k < idxs.length && k < cands.length; k++) {
-          matchByIdx.set(idxs[k], cands[k]);
-          claimed.add(cands[k].id);
-          await appendLog(`🔁 ${key.replace(/^(no|np):/, '').replace(/\|.*/, '')}: 캘린더의 짝 잃은 일정(${hhmm(cands[k].start?.dateTime)})을 바디코디 예약(${hhmm(evs[idxs[k]].start)})에 연결`);
-        }
+      if (m) take(bc, calId, m);
+    }
+  }
+  // 3차) 회원번호(또는 이름+연락처)로 같은 캘린더의 짝 잃은 일정 재사용 → 시간 이동 (시간순 1:1)
+  for (const [calId, grp] of byCal) {
+    const list = gcalByCal.get(calId) || [];
+    const unmatchedByKey = {};
+    for (const bc of grp.active) {
+      if (matchOf.has(bc)) continue;
+      const key = memberKeyOfBc(bc);
+      if (key) (unmatchedByKey[key] ||= []).push(bc);
+    }
+    for (const [key, bcs] of Object.entries(unmatchedByKey)) {
+      const cands = list
+        .filter(g => !claimed.has(ck(calId, g)) && g.start?.dateTime && memberKeyOfGcal(g) === key &&
+          // 아직 바디코디에 살아 있는 다른 예약의 일정은 빼앗지 않는다
+          !activeIds.has(g.extendedProperties?.private?.bcSyncId))
+        .sort((a, b) => (tsOf(a.start?.dateTime) || 0) - (tsOf(b.start?.dateTime) || 0));
+      if (!cands.length) continue;
+      bcs.sort((a, b) => (tsOf(a.start) || 0) - (tsOf(b.start) || 0));
+      for (let k = 0; k < bcs.length && k < cands.length; k++) {
+        take(bcs[k], calId, cands[k]);
+        await appendLog(`🔁 ${key.replace(/^(no|np):/, '').replace(/\|.*/, '')}: 캘린더의 짝 잃은 일정(${hhmm(cands[k].start?.dateTime)})을 바디코디 예약(${hhmm(bcs[k].start)})에 연결`);
       }
     }
+  }
 
-    // ⭐ v1.14.0: 바디코디에는 없는데 캘린더에 남아 있는 고객 일정(취소·범위 밖 이동 등) → 보고만 (삭제하지 않음)
-    //   주 단위 프리페치가 실패했으면 다음 주 이후 예약이 통째로 비어 보이므로 오탐 방지를 위해 건너뜀
-    if (prefetchOk) {
-      for (const g of gcalEvents) {
-        if (claimed.has(g.id) || !g.start?.dateTime) continue;
-        if (!isCustomerGcalEvent(g)) continue;
-        summary.orphans.push({ 캘린더: coachName, 시작: g.start.dateTime, 제목: g.summary || '(제목 없음)' });
+  // 4차) ⭐ v1.16.0: 취소 표시 대상
+  //   (가) 바디코디에서 "취소" 상태인 예약의 일정 — 예약번호 마커, 없으면 같은 시각·같은 회원번호
+  //   (나) 예약번호 마커가 있는데 바디코디 어디에도 그 예약이 없는 일정 (삭제됐거나 4주 밖으로 옮겨짐)
+  //        → 최신 데이터로 범위 전체를 빠짐없이 읽었을 때만, 그리고 한꺼번에 너무 많으면 보류
+  const cancelPlan = [];   // { calId, g, reason, bc? }
+  for (const [calId, grp] of byCal) {
+    const list = gcalByCal.get(calId) || [];
+    for (const bc of grp.cancelled) {
+      const bcStart = tsOf(bc.start);
+      const m =
+        list.find(g => !claimed.has(ck(calId, g)) && bc.id && g.extendedProperties?.private?.bcSyncId === bc.id) ||
+        list.find(g => {
+          if (claimed.has(ck(calId, g)) || bcStart === null || !bc.memberNo) return false;
+          const gs = tsOf(g.start?.dateTime);
+          return gs !== null && Math.abs(gs - bcStart) <= 3 * 60 * 1000 && memberNoInTitle(g.summary) === bc.memberNo;
+        });
+      if (m) { claimed.add(ck(calId, m)); cancelPlan.push({ calId, g: m, reason: '바디코디에서 취소됨', bc }); }
+    }
+  }
+  const gonePlan = [];
+  let markedTotal = 0;
+  for (const [calId, list] of gcalByCal) {
+    for (const g of list) {
+      const sid = g.extendedProperties?.private?.bcSyncId;
+      if (!sid || !g.start?.dateTime) continue;
+      markedTotal++;
+      if (claimed.has(ck(calId, g)) || allBcIds.has(sid)) continue;
+      gonePlan.push({ calId, g, reason: '바디코디에서 사라짐' });
+    }
+  }
+  const goneNew = gonePlan.filter(p => !isCancelMarked(p.g));
+  if (goneNew.length) {
+    const limit = Math.max(5, Math.ceil(markedTotal * 0.3));
+    if (!freshOk || !coverageOk) {
+      await appendLog(`⏸️ 사라진 예약 ${goneNew.length}건 취소 표시 보류 — ${!freshOk ? '최신 데이터가 아님' : '범위를 빠짐없이 읽지 못함'}`);
+    } else if (goneNew.length > limit) {
+      await appendLog(`⚠️ 사라진 예약이 ${goneNew.length}건으로 너무 많아(기준 ${limit}건) 취소 표시를 보류합니다 — 바디코디 화면이 제대로 읽혔는지 확인이 필요합니다`);
+    } else {
+      for (const p of gonePlan) { claimed.add(ck(p.calId, p.g)); cancelPlan.push(p); }
+    }
+  }
+
+  // 📍 보고: 짝도 없고 취소 표시 대상도 아닌 고객 일정
+  if (coverageOk) {
+    for (const [calId, list] of gcalByCal) {
+      const label = byCal.get(calId)?.label || calId;
+      for (const g of list) {
+        if (claimed.has(ck(calId, g)) || !g.start?.dateTime) continue;
+        if (!isCustomerGcalEvent(g) || isCancelMarked(g)) continue;
+        summary.orphans.push({ 캘린더: label, 시작: g.start.dateTime, 제목: g.summary || '(제목 없음)' });
       }
     }
+  }
 
-    for (const [idx, bc] of evs.entries()) {
-      // 진행률: 매 이벤트 시작 시 카운터 증가 (어떤 분기로 빠지든 진행 보장)
+  // ---------- 3단계: 실행 ----------
+  const totalToProcess = activeEvents.length + cancelPlan.length;
+  let processed = 0;
+  const bumpProgress = (label) => {
+    if (totalToProcess === 0) return;
+    reportProgress(25 + (processed / totalToProcess) * 70, label);
+  };
+
+  for (const [calId, grp] of byCal) {
+    for (const bc of grp.active) {
       processed++;
       const memberLabel = (`${bc.memberNo || ''} ${bc.memberName || ''}`).trim() || '(이름없음)';
       bumpProgress(`${processed}/${totalToProcess} ${memberLabel}`);
@@ -918,23 +1218,36 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       const newTitle = buildTitle(bc);
       if (!newTitle) { summary.skipped++; continue; }
 
-      // 매칭 결과는 위의 3단계 패스에서 이미 확정됨
-      const match = matchByIdx.get(idx);
+      const plan = matchOf.get(bc);
+      let match = plan?.g || null;
+      let calMoveInfo = null;
+
+      // ⭐ v1.16.0: 담당 강사가 바뀌어 다른 캘린더에 있는 일정 → 이 캘린더로 옮긴다 (삭제 아님)
+      if (match && plan.calId !== calId) {
+        const fromLabel = byCal.get(plan.calId)?.label || plan.calId;
+        if (dryRun) {
+          summary.details.push({ 시작: bc.start, 회원: memberLabel, 프로그램: bc.program, 매칭: true, 변경예정: true,
+            강사이동: `${fromLabel} → ${grp.label}`, 새제목: newTitle });
+          continue;
+        }
+        try {
+          match = await moveEventToCalendar(token, plan.calId, match.id, calId);
+          summary.calMoved++;
+          calMoveInfo = `${fromLabel} → ${grp.label}`;
+          await appendLog(`🔀 ${memberLabel}: 담당 변경 — 일정을 ${fromLabel} → ${grp.label} 캘린더로 옮김`);
+        } catch (err) {
+          await appendLog(`❌ 캘린더 이동 실패 (${memberLabel}): ${err.message} — 새 일정으로 만듭니다`);
+          match = null;
+        }
+      }
 
       if (!match) {
         // ⭐ v1.14.0: 짝이 없으면 캘린더에 새로 만든다 (설정으로 끌 수 있음)
         if (!createMissing) {
           summary.skipped++;
-          summary.details.push({
-            시작: bc.start,
-            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-            프로그램: bc.program,
-            매칭: false,
-            변경예정: false
-          });
+          summary.details.push({ 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: false, 변경예정: false });
           continue;
         }
-
         let createTitle = newTitle;
         if (bc.isAssessment && !/회차/.test(createTitle) && bc.round !== null && bc.round !== undefined) {
           createTitle = `${createTitle} ${bc.round}회차`;
@@ -945,22 +1258,10 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         if (tsOf(endIso) === null || tsOf(endIso) <= startTs) {
           endIso = new Date(startTs + 60 * 60 * 1000).toISOString();   // 종료 없으면 1시간
         }
-
-        if (dryRun) {
-          summary.details.push({
-            시작: bc.start,
-            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-            프로그램: bc.program,
-            매칭: false,
-            변경예정: true,
-            생성: true,
-            새제목: createTitle
-          });
-          continue;
-        }
-
+        const det = { 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: false, 변경예정: true, 생성: true, 새제목: createTitle };
+        if (dryRun) { summary.details.push(det); continue; }
         try {
-          await insertEvent(token, calendarId, {
+          await insertEvent(token, calId, {
             summary: createTitle,
             description: buildDescription(bc, ''),
             start: { dateTime: bc.start, timeZone: 'Asia/Seoul' },
@@ -968,46 +1269,29 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
             extendedProperties: { private: { bcSyncId: bc.id } }
           });
           summary.created++;
-          summary.details.push({
-            시작: bc.start,
-            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-            프로그램: bc.program,
-            매칭: false,
-            변경예정: true,
-            완료: true,
-            생성: true,
-            새제목: createTitle
-          });
+          summary.details.push({ ...det, 완료: true });
           await appendLog(`🆕 ${memberLabel}: 캘린더 일정 생성 ${hhmm(bc.start)} "${createTitle}"`);
         } catch (err) {
           summary.failed++;
           await appendLog(`❌ 생성 실패: ${err.message}`);
-          summary.details.push({
-            시작: bc.start,
-            회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-            프로그램: bc.program,
-            매칭: false,
-            실패: err.message
-          });
+          summary.details.push({ 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: false, 실패: err.message });
         }
         continue;
       }
 
       summary.matched++;
+      const wasCancelled = isCancelMarked(match);
 
       // ⭐ v1.9.0: 평가 프로그램은 "N회차"를 제목 끝에 보존
-      //   회차 우선순위: 앱이 만든 기존 GCal 제목의 "N회차" > BodyCodi 텍스트/계산값
       let finalTitle = newTitle;
       if (bc.isAssessment && !/회차/.test(finalTitle)) {
-        const gm = (match.summary || '').match(/(\d+)\s*회차/);
+        const gm = stripCancelPrefix(match.summary || '').match(/(\d+)\s*회차/);
         const round = gm ? parseInt(gm[1], 10) : bc.round;
         if (round !== null && round !== undefined) finalTitle = `${finalTitle} ${round}회차`;
       }
 
-      // ⭐ v1.12.0: 바디코디에서 일정 시간이 수정된 경우 캘린더 일정도 이동
-      //   종일(all-day) 일정은 대상에서 제외하고, 시작/종료를 둘 다 확정할 수 있을 때만 이동한다
-      //   (Google Calendar는 start만 보내면 end < start가 되어 거부될 수 있음)
-      const TIME_TOL_MS = 60 * 1000;   // 1분 이내 오차는 동일한 시각으로 간주
+      // ⭐ v1.12.0: 시간 변경 → 캘린더 일정 이동 (종일 일정 제외, 시작/종료 모두 확정될 때만)
+      const TIME_TOL_MS = 60 * 1000;
       let timeChanged = false;
       let newStartIso = null, newEndIso = null;
       if (match.start?.dateTime) {
@@ -1015,130 +1299,112 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         const bEndTs   = tsOf(bc.end);
         const gStartTs = tsOf(match.start.dateTime);
         const gEndTs   = tsOf(match.end?.dateTime);
-
         if (bStartTs !== null && gStartTs !== null) {
           const startDiff = Math.abs(bStartTs - gStartTs);
           const endDiff   = (bEndTs !== null && gEndTs !== null) ? Math.abs(bEndTs - gEndTs) : 0;
-
           if (startDiff > TIME_TOL_MS || endDiff > TIME_TOL_MS) {
             newStartIso = bc.start;
-            if (bEndTs !== null && bEndTs > bStartTs) {
-              newEndIso = bc.end;
-            } else if (gEndTs !== null && gEndTs > gStartTs) {
-              // 바디코디 종료시각이 없으면 기존 캘린더 일정의 소요시간을 그대로 유지
-              newEndIso = new Date(bStartTs + (gEndTs - gStartTs)).toISOString();
-            }
-            timeChanged = !!newEndIso;   // 종료시각을 정할 수 없으면 이동 보류(안전)
+            if (bEndTs !== null && bEndTs > bStartTs) newEndIso = bc.end;
+            else if (gEndTs !== null && gEndTs > gStartTs) newEndIso = new Date(bStartTs + (gEndTs - gStartTs)).toISOString();
+            timeChanged = !!newEndIso;
           }
         }
       }
 
-      // 사용자 콘텐츠 보존: 기존 description에서 관리 라인만 제거한 뒤 새 자동 라인 추가
       const newDesc = buildDescription(bc, match.description);
-
-      // description 필드를 PATCH에 포함할지 결정 (보수적 정책):
-      //   - 추가할 자동 정보(프로그램명/유효기간/총횟수/잔여횟수)가 있거나
-      //   - 정리할 레거시 [bc-sync:ID] 태그가 있을 때만 description 수정
-      //   - 그 외(자동정보가 전혀 없는 이벤트)에는 description 자체를 건드리지 않음 → 사용자 메모 100% 보존
       const hasNewAuto    = buildAutoLines(bc).length > 0;
       const hadLegacyTag  = /\[bc-sync:[^\]]*\]/.test(match.description || '');
       const shouldUpdateDesc = hasNewAuto || hadLegacyTag;
 
-      // alreadyOk: 제목 + (description 변경할 필요 없거나 이미 일치) + 숨겨진 매핑 마커 있을 때만
       const normalize = s => String(s || '').replace(/\r\n/g, '\n').trim();
       const hasBcSyncMarker = match.extendedProperties?.private?.bcSyncId === bc.id;
       const descAlreadyOk = !shouldUpdateDesc || normalize(match.description) === normalize(newDesc);
-      const alreadyOk =
-        match.summary === finalTitle &&
-        descAlreadyOk &&
-        hasBcSyncMarker &&
-        !timeChanged;
+      const alreadyOk = match.summary === finalTitle && descAlreadyOk && hasBcSyncMarker && !timeChanged && !wasCancelled && !calMoveInfo;
 
+      const base = { 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: true };
       if (alreadyOk) {
-        summary.details.push({
-          시작: bc.start,
-          회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-          프로그램: bc.program,
-          매칭: true,
-          변경예정: false,
-          사유: '이미 동기화됨'
-        });
+        summary.details.push({ ...base, 변경예정: false, 사유: '이미 동기화됨' });
         continue;
       }
-
+      const changeInfo = {
+        기존제목: match.summary, 새제목: finalTitle,
+        새설명: shouldUpdateDesc ? (newDesc || '(빈 설명)') : '(기존 유지)',
+        ...(timeChanged ? { 시간이동: `${hhmm(match.start?.dateTime)} → ${hhmm(newStartIso)}` } : {}),
+        ...(wasCancelled ? { 복구: true } : {}),
+        ...(calMoveInfo ? { 강사이동: calMoveInfo } : {})
+      };
       if (dryRun) {
-        summary.details.push({
-          시작: bc.start,
-          회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-          프로그램: bc.program,
-          매칭: true,
-          변경예정: true,
-          기존제목: match.summary,
-          새제목: finalTitle,
-          새설명: shouldUpdateDesc ? (newDesc || '(빈 설명)') : '(기존 유지)',
-          ...(timeChanged ? { 시간이동: `${hhmm(match.start?.dateTime)} → ${hhmm(newStartIso)}` } : {})
-        });
+        summary.details.push({ ...base, 변경예정: true, ...changeInfo });
         continue;
       }
 
       try {
-        // 진단: PATCH 직전에 변경 내역 로그
         const oldDescPreview = (match.description || '').replace(/\n/g, ' ⏎ ').slice(0, 80);
-        const newDescPreview = shouldUpdateDesc
-          ? ((newDesc || '').replace(/\n/g, ' ⏎ ').slice(0, 80) || '(빈 설명)')
-          : '(유지)';
-
-        // 조건부 PATCH body 구성: description 필드는 필요할 때만 포함
-        const patchBody = {
-          summary: finalTitle,
-          extendedProperties: {
-            private: { bcSyncId: bc.id }          // 숨겨진 매칭 마커
-          }
-        };
-        if (shouldUpdateDesc) {
-          patchBody.description = newDesc;        // 정리/갱신 필요할 때만 명시
-        }
+        const newDescPreview = shouldUpdateDesc ? ((newDesc || '').replace(/\n/g, ' ⏎ ').slice(0, 80) || '(빈 설명)') : '(유지)';
+        const priv = { bcSyncId: bc.id };
+        const patchBody = { summary: finalTitle, extendedProperties: { private: priv } };
+        if (shouldUpdateDesc) patchBody.description = newDesc;
         if (timeChanged) {
-          // 기존 일정의 timeZone 설정을 그대로 계승 (캘린더별 시간대 차이로 인한 틀어짐 방지)
           const tzStart = match.start?.timeZone;
           const tzEnd   = match.end?.timeZone || tzStart;
           patchBody.start = { dateTime: newStartIso, ...(tzStart ? { timeZone: tzStart } : {}) };
           patchBody.end   = { dateTime: newEndIso,   ...(tzEnd   ? { timeZone: tzEnd   } : {}) };
         }
-        // description 필드가 patchBody에 없으면 Google Calendar API는 기존 값을 그대로 유지
-
+        if (wasCancelled) {
+          // ⭐ v1.16.0: 다시 살아난 예약 → [취소] 표시 해제, 원래 색·바쁨 표시 복구
+          const prev = match.extendedProperties?.private?.bcPrevColor;
+          patchBody.colorId = prev ? prev : null;
+          patchBody.transparency = 'opaque';
+          priv.bcCancelled = '0';
+        }
         const oldStartLabel = hhmm(match.start?.dateTime);
-
-        await patchEvent(token, calendarId, match.id, patchBody);
+        try {
+          await patchEvent(token, calId, match.id, patchBody);
+        } catch (e) {
+          // 색 지우기(null)를 거부하는 경우 대비: 색 없이 한 번 더
+          if (!(wasCancelled && /GCal 400/.test(e.message))) throw e;
+          delete patchBody.colorId;
+          await patchEvent(token, calId, match.id, patchBody);
+        }
         summary.updated++;
         if (timeChanged) summary.timeMoved++;
-        summary.details.push({
-          시작: bc.start,
-          회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-          프로그램: bc.program,
-          매칭: true,
-          변경예정: true,
-          완료: true,
-          기존제목: match.summary,
-          새제목: finalTitle,
-          새설명: shouldUpdateDesc ? (newDesc || '(빈 설명)') : '(기존 유지)',
-          ...(timeChanged ? { 시간이동: `${oldStartLabel} → ${hhmm(newStartIso)}` } : {})
-        });
-        if (timeChanged) {
-          await appendLog(`🕒 ${memberLabel}: 일정 시간 이동 ${oldStartLabel} → ${hhmm(newStartIso)}`);
-        }
+        if (wasCancelled) summary.restored++;
+        summary.details.push({ ...base, 변경예정: true, 완료: true, ...changeInfo });
+        if (wasCancelled) await appendLog(`♻️ ${memberLabel}: 예약이 다시 살아나 [취소] 표시 해제 ${hhmm(bc.start)}`);
+        if (timeChanged) await appendLog(`🕒 ${memberLabel}: 일정 시간 이동 ${oldStartLabel} → ${hhmm(newStartIso)}`);
         await appendLog(`✏️ ${memberLabel}: 제목 "${match.summary}" → "${finalTitle}" / 설명 "${oldDescPreview}" → "${newDescPreview}"`);
       } catch (err) {
         summary.failed++;
         await appendLog(`❌ patch 실패: ${err.message}`);
-        summary.details.push({
-          시작: bc.start,
-          회원: `${bc.memberNo} ${bc.memberName}`.trim(),
-          프로그램: bc.program,
-          매칭: true,
-          실패: err.message
-        });
+        summary.details.push({ ...base, 실패: err.message });
       }
+    }
+  }
+
+  // ⭐ v1.16.0: 취소 표시 실행 — 일정은 지우지 않고 제목 앞에 [취소], 회색, "한가함"으로 바꾼다
+  for (const p of cancelPlan) {
+    processed++;
+    const g = p.g;
+    const label = byCal.get(p.calId)?.label || p.calId;
+    bumpProgress(`${processed}/${totalToProcess} 취소 표시`);
+    if (isCancelMarked(g) && String(g.summary || '').startsWith(CANCEL_PREFIX)) continue;   // 이미 표시됨
+    const det = { 시작: g.start?.dateTime, 회원: stripCancelPrefix(g.summary || ''), 캘린더: label, 취소: p.reason, 변경예정: true };
+    if (dryRun) { summary.details.push(det); continue; }
+    try {
+      const priv = { bcSyncId: g.extendedProperties?.private?.bcSyncId || p.bc?.id || '', bcCancelled: '1', bcPrevColor: g.colorId || '' };
+      await patchEvent(token, p.calId, g.id, {
+        summary: CANCEL_PREFIX + stripCancelPrefix(g.summary || ''),
+        colorId: CANCEL_COLOR_ID,
+        transparency: 'transparent',
+        extendedProperties: { private: priv }
+      });
+      summary.cancelled++;
+      summary.details.push({ ...det, 완료: true });
+      await appendLog(`🚫 ${stripCancelPrefix(g.summary || '')}: ${p.reason} → 캘린더에 [취소] 표시 (${hhmm(g.start?.dateTime)}, 삭제 안 함)`);
+    } catch (err) {
+      summary.failed++;
+      await appendLog(`❌ 취소 표시 실패: ${err.message}`);
+      summary.details.push({ ...det, 실패: err.message });
     }
   }
 
@@ -1148,7 +1414,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
   await appendLog(
     `✅ 완료 v${version} trig=${trigger} dry=${dryRun} ` +
-    `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 생성=${summary.created} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
+    `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 생성=${summary.created} 취소표시=${summary.cancelled} 복구=${summary.restored} 강사이동=${summary.calMoved} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
   );
   reportProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
   return { summary };
@@ -1281,48 +1547,76 @@ async function initAutoReload() {
 
 initAutoReload();
 
-// ---------- 알람 (평일 09:00 ~ 21:00 매시 정각) ----------
+// ---------- 알람: 사용자가 고른 주기로 자동 동기화 (평일 09:00 ~ 21:00) ----------
+// ⭐ v1.16.0: 팝업 드롭다운에서 15분 ~ 24시간 중 선택 (기본 1시간 = 이전 버전과 동일)
+//   - 하루 시간표: 09:00부터 N분 간격, 21:00까지 (예: 6시간 → 09·15·21시, 24시간 → 09시)
+//   - 다음 실행 시각 하나만 'sync-next' 알람으로 걸고, 울리면 그다음 시각을 다시 건다.
+//   - 1분마다 도는 업데이트 확인 알람이 'sync-next'가 사라졌는지도 점검한다 (자가 복구).
 const SYNC_START_HOUR = 9;
-const SYNC_END_HOUR = 21;   // 포함 (09,10,...,21시 = 13회)
+const SYNC_END_HOUR = 21;   // 포함
+const SYNC_ALARM = 'sync-next';
+const SYNC_INTERVAL_CHOICES = [15, 30, 45, 60, 120, 180, 360, 720, 1440];
+const DEFAULT_SYNC_INTERVAL = 60;
 
-function nextTimeToday(hour, minute) {
-  const now = new Date();
-  const t = new Date();
-  t.setHours(hour, minute, 0, 0);
-  if (t.getTime() <= now.getTime()) t.setDate(t.getDate() + 1);
-  return t.getTime();
+function normalizeInterval(v) {
+  const n = Number(v);
+  return SYNC_INTERVAL_CHOICES.includes(n) ? n : DEFAULT_SYNC_INTERVAL;
+}
+
+// now 이후의 첫 실행 시각 (평일, 09:00 + k*interval ≤ 21:00)
+function nextSyncSlot(now, intervalMin) {
+  const interval = normalizeInterval(intervalMin);
+  const nowMs = now.getTime();
+  for (let dayOffset = 0; dayOffset < 8; dayOffset++) {
+    const day = new Date(now);
+    day.setDate(day.getDate() + dayOffset);
+    day.setHours(SYNC_START_HOUR, 0, 0, 0);
+    const wd = day.getDay();
+    if (wd === 0 || wd === 6) continue;   // 주말 제외
+    const last = new Date(day); last.setHours(SYNC_END_HOUR, 0, 0, 0);
+    for (let t = day.getTime(); t <= last.getTime(); t += interval * 60000) {
+      if (t > nowMs + 1000) return t;
+    }
+  }
+  return nowMs + interval * 60000;   // 도달하지 않음 (안전장치)
+}
+
+async function scheduleNextSync({ force = false } = {}) {
+  const { syncIntervalMin } = await chrome.storage.local.get('syncIntervalMin');
+  const interval = normalizeInterval(syncIntervalMin);
+  if (!force) {
+    const existing = await chrome.alarms.get(SYNC_ALARM);
+    if (existing) return existing.scheduledTime;
+  }
+  const when = nextSyncSlot(new Date(), interval);
+  await chrome.alarms.create(SYNC_ALARM, { when });
+  return when;
 }
 
 async function ensureAlarms() {
-  // 평일 09~21시 매시 정각 (주말은 onAlarm 핸들러에서 스킵)
-  const desired = [];
-  for (let h = SYNC_START_HOUR; h <= SYNC_END_HOUR; h++) {
-    desired.push({ name: `sync-${String(h).padStart(2, '0')}00`, hour: h, minute: 0 });
-  }
-  const desiredNames = new Set(desired.map(d => d.name));
+  // 이전 버전의 매시 정각 알람(sync-0900 ~ sync-2100) 정리
   const existing = await chrome.alarms.getAll();
-
-  // 더 이상 원하지 않는 sync-* 알람 정리 (예: 이전 버전의 sync-2200 등 범위 밖 알람)
   for (const alarm of existing) {
-    if (alarm.name.startsWith('sync-') && !desiredNames.has(alarm.name)) {
+    if (alarm.name.startsWith('sync-') && alarm.name !== SYNC_ALARM) {
       await chrome.alarms.clear(alarm.name);
     }
   }
-
-  // 신규 알람 등록 (이미 존재하는 건 그대로)
-  const existingNames = new Set(existing.map(a => a.name));
-  for (const d of desired) {
-    if (!existingNames.has(d.name)) {
-      chrome.alarms.create(d.name, {
-        when: nextTimeToday(d.hour, d.minute),
-        periodInMinutes: 24 * 60
-      });
-    }
-  }
+  await scheduleNextSync();
 }
 
 chrome.runtime.onInstalled.addListener(() => { ensureAlarms(); });
 chrome.runtime.onStartup.addListener(() => { ensureAlarms(); });
+
+// 팝업에서 주기를 바꾸면 즉시 다음 실행 시각을 다시 계산
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.syncIntervalMin) {
+    scheduleNextSync({ force: true }).then(when => {
+      const p = n => String(n).padStart(2, '0');
+      const d = new Date(when);
+      appendLog(`⏱️ 자동 동기화 주기 변경: ${normalizeInterval(changes.syncIntervalMin.newValue)}분 — 다음 실행 ${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`);
+    });
+  }
+});
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   // ⭐ v1.12.0: 자동 업데이트 확인 (동기화와 무관하게 주말에도 동작)
@@ -1332,17 +1626,25 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     } catch (err) {
       await appendLog(`❌ 자동 업데이트 확인 실패: ${err.message}`);
     }
+    // 자가 복구: 다음 동기화 알람이 사라졌으면 다시 건다
+    try { await scheduleNextSync(); } catch (e) { /* ignore */ }
     return;
   }
 
-  // sync-* 알람은 평일만 실행 (월~금)
-  if (alarm.name.startsWith('sync-')) {
-    const day = new Date().getDay(); // 0=일, 1=월, ..., 6=토
-    if (day === 0 || day === 6) {
-      const dayName = day === 0 ? '일요일' : '토요일';
-      await appendLog(`⏸️ ${dayName} — 자동 동기화 스킵 (alarm=${alarm.name})`);
-      return;
-    }
+  if (alarm.name !== SYNC_ALARM) {
+    // 이전 버전에서 남은 알람 — 정리만 한다
+    if (alarm.name.startsWith('sync-')) await chrome.alarms.clear(alarm.name);
+    return;
+  }
+
+  // 다음 실행 시각부터 먼저 건다 (동기화가 실패해도 일정이 끊기지 않도록)
+  try { await scheduleNextSync({ force: true }); } catch (e) { /* ignore */ }
+
+  // 크롬이 꺼져 있다가 주말에 켜져서 밀린 알람이 울린 경우 건너뜀
+  const day = new Date().getDay(); // 0=일, 6=토
+  if (day === 0 || day === 6) {
+    await appendLog(`⏸️ ${day === 0 ? '일요일' : '토요일'} — 자동 동기화 스킵`);
+    return;
   }
 
   try {
