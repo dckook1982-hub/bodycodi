@@ -73,7 +73,7 @@ Runs the automatic sync at the interval the user selects (15 minutes to 24 hours
 
 `scripting`
 ```
-Runs a read-only script in the open BodyCodi schedule tab to read the appointments shown by the page's scheduler (and to move the page's calendar view forward week by week to read 4 weeks, then restore it).
+Runs a read-only script in the BodyCodi schedule page (the background tab the extension opens for each sync, or an already open schedule tab as a fallback) to read the appointments held by the page's scheduler, moving that page's calendar view week by week to cover 4 weeks.
 ```
 
 `tabs`
@@ -83,7 +83,7 @@ Opens the BodyCodi schedule page (crm.bodycodi.com/manager/schedule) in a backgr
 
 호스트 권한 (`https://crm.bodycodi.com/*`, `https://www.googleapis.com/*`)
 ```
-crm.bodycodi.com: read the appointment schedule the user is viewing. www.googleapis.com: call the Google Calendar API to list, update and create events in the user's own calendars. No other hosts are contacted.
+crm.bodycodi.com: read the appointment schedule of the BodyCodi account the user is logged in to. www.googleapis.com: call the Google Calendar API to list, update and create events in the user's own calendars. No other hosts are contacted.
 ```
 
 **원격 코드 사용 (Remote code)**
