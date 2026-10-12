@@ -80,7 +80,7 @@ ID 확인이 끝나면 바탕화면의 `...-FIRST-...zip`은 지웁니다.
 - 설명: A의 회색 상자 내용
 - 카테고리: 생산성 → 업무 흐름 및 계획
 - 언어: 한국어
-- 이미지: `icons/icon128.png`, `store/screenshot-1280x800.png`, `store/promo-440x280.png`
+- 이미지: `icons/icon128.png`, `store/screenshot-1280x800.jpg`, `store/promo-440x280.jpg`
 
 **임시저장**을 누릅니다.
 
