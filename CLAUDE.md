@@ -18,6 +18,7 @@
 7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다.
    - **웹스토어 항목은 이미 있다**: 이름 "BodyCodi → Google Calendar Sync", 항목 ID `heojbjjphafhlepaopagaejebacclfmc`, 상태 "게시됨 - 미등록". 새 항목을 만들지 말고 이 항목에 새 패키지를 올린다 (`MAKE-STORE-ZIP.bat`·개인키 불필요).
    - 이 ID는 unpacked ID(`clgekekmmlpiggplilhgagfkepepjelk`)와 달라서 OAuth 클라이언트가 따로 필요하다. 스토어용 ZIP의 `oauth2.client_id`만 그 클라이언트 ID로 바꾼다 (저장소의 `manifest.json`은 그대로).
+   - 스토어용 OAuth 클라이언트 ID: `969122042285-8eeaqe29m3nn1lsqomnlo2rc64qblukn.apps.googleusercontent.com` (v1.17.0부터 스토어용 ZIP에 적용).
 
 ## 절대 하지 말 것
 
@@ -28,7 +29,7 @@
 
 ## 구조 메모
 
-- `background.js`: 동기화 본체. `SYNC_WEEKS`(기본 4)가 범위. 바디코디는 `openFreshBodyCodiTab`이 연 새 탭에서 읽는다(화면 단위로 넘기며 `bc-netlog`의 요청 완료를 기다림). 모든 매핑 캘린더를 먼저 조회한 뒤 매칭 계획 → 실행. 매칭은 ① 같은 캘린더 예약번호 마커 ② 다른 캘린더 마커(강사 변경 → `events.move`) ③ 시간 ±3분(다른 회원번호면 제외) ④ 회원번호 기준 짝 잃은 일정 재사용. 짝 없으면 생성(`createMissing`). 취소 상태·사라진 예약은 `[취소]` 표시. 자동 주기는 `syncIntervalMin`(15~1440분, 평일 09~21시) 하나의 `sync-next` 알람.
-- 검증 스크립트(채팅 세션 scratchpad에 있었음): chrome/fetch 모킹 runSync 시뮬레이션 + 실제 Chromium에 확장을 올려 가짜 바디코디·가짜 캘린더 API(HTTPS, host-resolver-rules)로 끝까지 실행.
+- `background.js`: 동기화 본체. `SYNC_WEEKS`(기본 4)가 범위. 바디코디는 `openFreshBodyCodiTab`이 연 새 탭에서 읽는다(화면 단위로 넘기며 `bc-netlog`의 요청 완료를 기다림). 모든 매핑 캘린더를 먼저 조회한 뒤 매칭 계획 → 실행. 매칭은 ① 같은 캘린더 예약번호 마커 ② 다른 캘린더 마커(강사 변경 → `events.move`) ③ 시간 ±3분(다른 회원번호면 제외) ④ 회원번호 기준 짝 잃은 일정 재사용. 짝 없으면 생성(`createMissing`). 취소 상태·사라진 예약은 `[취소]` 표시. v1.17.0: 데이터엔 있으나 화면(DOM `[event_id]`)에 안 그려진 예약도 취소로 본다(그 강사의 다른 예약이 그려져 있고 숨김 1건 또는 1/3 이하, 0.4초 후 재확인). "사라짐"은 캘린더별로 판정(그 캘린더 강사 예약이 데이터에 없으면 보류, 50%/최소 5건 대량 보류, 시간초과·0건 주 보류). 자동 주기는 `syncIntervalMin`(15~1440분, 평일 09~21시) 하나의 `sync-next` 알람.
+- 검증 스크립트(채팅 세션 scratchpad에 있었음): chrome/fetch 모킹 runSync 시뮬레이션(가짜 scheduler + 가짜 DOM으로 숨김·강사 필터·시간초과 시나리오 포함) + 실제 Chromium에 확장을 올려 가짜 바디코디·가짜 캘린더 API(HTTPS, host-resolver-rules)로 끝까지 실행.
 - `bc-netlog.js`: 바디코디 페이지의 서버 응답에서 이용권 유효기간 후보 필드만 기록하는 탐지기 (개인정보 미기록).
 - `AUTO-UPDATE.ps1` / `.vbs`, `SETUP-PERMANENT.ps1`, `INSTALL.bat`, `UNINSTALL.bat`: Windows 배포. `.ps1`은 UTF-8 BOM 필수.

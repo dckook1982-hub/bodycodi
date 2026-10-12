@@ -254,8 +254,8 @@ function renderResult(details, dryRun, orphans) {
   addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀 (새로 만들기 꺼짐)', skipped, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
 
-  addSection('📍', '바디코디 예약과 연결되지 않은 고객 일정 — 직접 만든 일정일 수 있음 (그대로 둠, 확인 필요)', orphanList, d =>
-    `   · ${fmtWhen(d.시작)}  ${d.제목 || ''}  [${d.캘린더 || ''}]`);
+  addSection('📍', '바디코디 예약과 연결되지 않은 고객 일정 — 그대로 둠, 사유 확인', orphanList, d =>
+    `   · ${fmtWhen(d.시작)}  ${d.제목 || ''}  [${d.캘린더 || ''}]${d.사유 ? `\n     ${d.사유}` : ''}`);
 
   if (alreadyOk > 0) out.push(`✅ 이미 동기화됨 — ${alreadyOk}건 (표시 생략)`);
 
@@ -292,7 +292,8 @@ function runSync(dryRun) {
     const createdText = createdCount > 0 ? ` · 🆕생성=${createdCount}` : '';
     const cancelCount = dryRun ? (s.details || []).filter(d => d.취소).length : (s.cancelled || 0);
     const coachMvCount = dryRun ? (s.details || []).filter(d => d.강사이동).length : (s.calMoved || 0);
-    const extraText = (cancelCount ? ` · 🚫취소=${cancelCount}` : '') + (coachMvCount ? ` · 🔀강사변경=${coachMvCount}` : '');
+    const extraText = (cancelCount ? ` · 🚫취소=${cancelCount}` : '') + (coachMvCount ? ` · 🔀강사변경=${coachMvCount}` : '') +
+      (s.goneHeld ? ` · ⏸️취소보류=${s.goneHeld}(로그 확인)` : '');   // ⭐ v1.17.0
 
     setStatus(
       dryRun

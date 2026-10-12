@@ -338,7 +338,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
 
           if (!origDate || typeof scheduler.setCurrentView !== 'function') {
             const evs = scheduler.getEvents();
-            return { events: evs, prefetched: false, complete: false, views: [], hiddenCount: 0, waitModes: [] };
+            return { events: evs, prefetched: false, complete: false, views: [], hiddenCount: 0, hiddenCancelCount: 0, waitModes: [], hiddenIds: new Set(), hiddenCancelIds: new Set() };
           }
 
           // 사용자 탭에서 읽는 경우: 지금 보고 있는 주를 다시 받아오게 하려고 먼저 범위 밖으로 한 번 이동
@@ -353,7 +353,21 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
           const byId = new Map();
           const views = [];
           const waitModes = [];
-          let hiddenCount = 0, domSeen = false;
+          let hiddenCount = 0, hiddenCancelCount = 0, domSeen = false;
+          // 페이지의 예약 객체는 건드리지 않고 id로만 기록 (사용자 탭에서 읽을 때 흔적이 남지 않도록)
+          const hiddenIds = new Set(), hiddenCancelIds = new Set();
+          // dhtmlx 화면에 그려지는 시간대 (이 밖의 예약은 원래 안 그려지므로 "숨김" 판정에서 제외)
+          const FIRST_H = Number(scheduler.config && scheduler.config.first_hour) || 0;
+          const LAST_H  = Number(scheduler.config && scheduler.config.last_hour) || 24;
+          const coachOf = (ev) => String(ev.section_id || ev.coach_id || '');
+          const drawableTime = (ev) => {
+            const s = ev.start_date instanceof Date ? ev.start_date : new Date(ev.start_date);
+            const e = ev.end_date instanceof Date ? ev.end_date : new Date(ev.end_date);
+            if (isNaN(s) || isNaN(e) || e - s >= DAY) return false;
+            const sh = s.getHours() + s.getMinutes() / 60;
+            const eh = (e.getDate() !== s.getDate()) ? 24 : e.getHours() + e.getMinutes() / 60;
+            return sh >= FIRST_H && eh <= LAST_H;
+          };
           let cursor = RANGE_START_MS;
           let complete = false;
           for (let guard = 0; guard < 45; guard++) {
@@ -377,18 +391,52 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
               break;   // 화면 이동 실패 → 범위 불완전
             }
             const shown = renderedIds();
-            if (shown.size) domSeen = true;
-            let n = 0;
+            const inView = [];
             for (const ev of got) {
               const t = evStartMs(ev);
               if (t === null || t < vmin || t >= vmax) continue;
               const id = String(ev.id || ev.seq_schedule || '');
               if (!id) continue;
+              inView.push(ev);
               byId.set(id, ev);
-              n++;
-              if (shown.size && !shown.has(String(ev.id))) { ev.__bcHidden = true; hiddenCount++; }
             }
-            views.push({ from: vmin, to: vmax, count: n });
+            // ⭐ v1.17.0: "데이터엔 있지만 화면에 안 그려진 예약" = 바디코디에서 지웠거나 취소한 예약일 가능성
+            //   단, 아래 경우는 판정하지 않는다 (오판 방지)
+            //   - 이 화면에 그려진 예약이 하나도 없을 때 (화면 그리기를 확인할 수 없음)
+            //   - 그 강사의 예약이 이 화면에 하나도 안 그려졌을 때 (강사 필터로 숨겨진 것)
+            //   - 그 강사 예약 중 1/3 넘게 숨겨졌을 때 (OT 숨기기 같은 보기 설정일 가능성)
+            //   - 화면 표시 시간대 밖이거나 하루를 넘는 일정
+            //   - 0.4초 뒤 다시 봤을 때 그려져 있으면 (그리기가 늦었던 것)
+            let renderedInView = 0;
+            const perCoach = {};
+            for (const ev of inView) {
+              const c = coachOf(ev);
+              const pc = perCoach[c] || (perCoach[c] = { total: 0, shown: 0, hiddenDrawable: [] });
+              pc.total++;
+              if (shown.has(String(ev.id))) { pc.shown++; renderedInView++; }
+              else if (drawableTime(ev)) pc.hiddenDrawable.push(ev);
+            }
+            const domWorks = renderedInView > 0;
+            if (domWorks) {
+              domSeen = true;
+              for (const ev of inView) if (!shown.has(String(ev.id))) { hiddenIds.add(String(ev.id)); hiddenCount++; }
+              const cands = [];
+              for (const c of Object.keys(perCoach)) {
+                const pc = perCoach[c];
+                if (!pc.shown || !pc.hiddenDrawable.length) continue;
+                if (pc.hiddenDrawable.length > 1 && pc.hiddenDrawable.length / pc.total > 1 / 3) continue;
+                cands.push(...pc.hiddenDrawable);
+              }
+              if (cands.length) {
+                await new Promise(r => setTimeout(r, 400));
+                const shown2 = renderedIds();
+                for (const ev of cands) {
+                  if (shown2.has(String(ev.id))) continue;
+                  hiddenCancelIds.add(String(ev.id)); hiddenCancelCount++;
+                }
+              }
+            }
+            views.push({ from: vmin, to: vmax, count: inView.length, rendered: renderedInView, reliable: domWorks });
             cursor = vmax;
           }
 
@@ -400,7 +448,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
           }
           return {
             events: Array.from(byId.values()), prefetched: true, complete, views,
-            hiddenCount: domSeen ? hiddenCount : null, waitModes
+            hiddenCount: domSeen ? hiddenCount : null, hiddenCancelCount, waitModes, hiddenIds, hiddenCancelIds
           };
         };
 
@@ -639,8 +687,11 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
           if (parts.some(p => /^\[?\(?취소(됨)?\]?\)?$/.test(p)) || /\[취소\]|\(취소\)|예약\s*취소|취소된\s*예약/.test(raw)) {
             cancelled = true;
           }
+          let cancelReason = cancelled ? 'status' : '';
+          // ⭐ v1.17.0: 상태값으로는 모르지만 화면에서 사라진 예약 (위의 안전 조건을 통과한 것만)
+          if (!cancelled && _prefetch.hiddenCancelIds.has(String(ev.id))) { cancelled = true; cancelReason = 'hidden'; }
           statusPairs.forEach(sp => { _statusDist[sp] = (_statusDist[sp] || 0) + 1; });
-          if (ev.__bcHidden) {
+          if (_prefetch.hiddenIds.has(String(ev.id))) {
             _hiddenSamples.length < 3 && _hiddenSamples.push({ text: raw.slice(0, 24), status: statusPairs.join(',') });
           }
 
@@ -742,7 +793,8 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
             isAssessment,
             round,
             cancelled,
-            hidden:      !!ev.__bcHidden
+            cancelReason,
+            hidden:      _prefetch.hiddenIds.has(String(ev.id))
           };
         });
 
@@ -768,6 +820,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
               },
               statusDist: _statusDist,
               hiddenCount: _prefetch.hiddenCount,
+              hiddenCancelCount: _prefetch.hiddenCancelCount || 0,
               hiddenSamples: _hiddenSamples
             }
           }
@@ -1152,41 +1205,125 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   //   (나) 예약번호 마커가 있는데 바디코디 어디에도 그 예약이 없는 일정 (삭제됐거나 4주 밖으로 옮겨짐)
   //        → 최신 데이터로 범위 전체를 빠짐없이 읽었을 때만, 그리고 한꺼번에 너무 많으면 보류
   const cancelPlan = [];   // { calId, g, reason, bc? }
+  const CANCEL_REASON = { status: '바디코디에서 취소됨', hidden: '바디코디 화면에서 사라짐(삭제·취소)' };
+  const WIN = 3 * 60 * 1000;
   for (const [calId, grp] of byCal) {
     const list = gcalByCal.get(calId) || [];
     for (const bc of grp.cancelled) {
       const bcStart = tsOf(bc.start);
+      const key = memberKeyOfBc(bc);
       const m =
         list.find(g => !claimed.has(ck(calId, g)) && bc.id && g.extendedProperties?.private?.bcSyncId === bc.id) ||
         list.find(g => {
-          if (claimed.has(ck(calId, g)) || bcStart === null || !bc.memberNo) return false;
+          if (claimed.has(ck(calId, g)) || bcStart === null || !key) return false;
+          // 다른 (살아 있는) 예약의 마커가 박힌 일정은 건드리지 않는다
+          const sid = g.extendedProperties?.private?.bcSyncId;
+          if (sid && sid !== bc.id && activeIds.has(sid)) return false;
           const gs = tsOf(g.start?.dateTime);
-          return gs !== null && Math.abs(gs - bcStart) <= 3 * 60 * 1000 && memberNoInTitle(g.summary) === bc.memberNo;
+          return gs !== null && Math.abs(gs - bcStart) <= WIN && memberKeyOfGcal(g) === key;
         });
-      if (m) { claimed.add(ck(calId, m)); cancelPlan.push({ calId, g: m, reason: '바디코디에서 취소됨', bc }); }
+      if (m) {
+        claimed.add(ck(calId, m));
+        cancelPlan.push({ calId, g: m, reason: CANCEL_REASON[bc.cancelReason] || CANCEL_REASON.status, bc });
+      }
     }
   }
-  const gonePlan = [];
-  let markedTotal = 0;
+
+  // ⭐ v1.17.0: "바디코디에서 사라진 일정" 판정 — 캘린더마다 따로 본다
+  //   대상: 예약번호 마커가 있는데 그 예약이 바디코디 데이터 어디에도 없음
+  //   (마커 없는 일정 = 확장이 만든 적 없는 일정은 표시하지 않고 📍로 보고만 — 사유를 함께 적는다)
+  //   보류: 최신 데이터가 아님 / 범위를 다 못 읽음 / 화면 로딩 시간초과 /
+  //         그 캘린더의 강사 예약이 이번 데이터에 하나도 없음(강사 필터 등) / 그 캘린더 고객 일정의 절반 넘게 사라짐
+  const timeouts = (pf.waitModes || []).filter(w => w === 'timeout').length;
+  const loadedCoaches = new Set(events.map(e => e.coachId).filter(Boolean).map(String));
+  const coachesOfCal = {};
+  for (const [cid, cal] of Object.entries(coachCalendarMap)) (coachesOfCal[cal] ||= []).push(String(cid));
+  // 바디코디 예약(상태·강사 무관)의 시각 색인 — 📍 보고 사유 판정용
+  //   같은 시각(±3분)에 회원키가 같거나, 회원번호·성함이 제목에 들어 있는 예약이 있으면 "있음"
+  const bcByMinute = new Map();
+  for (const ev of events) {
+    const t = tsOf(ev.start);
+    if (t === null) continue;
+    const m = Math.round(t / 60000);
+    (bcByMinute.get(m) || bcByMinute.set(m, []).get(m)).push(ev);
+  }
+  const bcExistsFor = (g) => {
+    const t = tsOf(g.start?.dateTime), key = memberKeyOfGcal(g);
+    if (t === null || !key) return true;   // 판단 불가 → 있는 것으로 (건드리지 않음)
+    const title = String(g.summary || '');
+    const m = Math.round(t / 60000);
+    for (let d = -3; d <= 3; d++) {
+      for (const ev of bcByMinute.get(m + d) || []) {
+        if (memberKeyOfBc(ev) === key) return true;
+        if (ev.memberNo && title.includes(ev.memberNo)) return true;
+        if (ev.memberName && title.includes(ev.memberName)) return true;
+      }
+    }
+    return false;
+  };
+
+  // 예약이 0건으로 읽힌 화면(주) — 연휴일 수도 있지만 로딩 실패일 수도 있어 그 구간은 사라짐 판정 보류
+  const emptyViews = (pf.views || []).filter(v => !v.error && v.count === 0 && v.to > v.from);
+  const inEmptyView = (g) => {
+    const t = tsOf(g.start?.dateTime);
+    return t !== null && emptyViews.some(v => t >= v.from && t < v.to);
+  };
+  let emptyHeld = 0;
+
+  const goneByCal = new Map();   // calId → { plan: [], customerTotal }
   for (const [calId, list] of gcalByCal) {
+    const plan = [];
+    let customerTotal = 0;
     for (const g of list) {
+      if (!g.start?.dateTime || !isCustomerGcalEvent(g)) continue;
+      customerTotal++;
+      if (claimed.has(ck(calId, g))) continue;
       const sid = g.extendedProperties?.private?.bcSyncId;
-      if (!sid || !g.start?.dateTime) continue;
-      markedTotal++;
-      if (claimed.has(ck(calId, g)) || allBcIds.has(sid)) continue;
-      gonePlan.push({ calId, g, reason: '바디코디에서 사라짐' });
+      if (!sid || allBcIds.has(sid)) continue;
+      const p = { calId, g, reason: '바디코디에서 사라짐' };
+      if (!isCancelMarked(g) && inEmptyView(g)) { emptyHeld++; claimed.add(ck(calId, g)); continue; }
+      plan.push(p);
     }
+    goneByCal.set(calId, { plan, customerTotal });
   }
-  const goneNew = gonePlan.filter(p => !isCancelMarked(p.g));
-  if (goneNew.length) {
-    const limit = Math.max(5, Math.ceil(markedTotal * 0.3));
-    if (!freshOk || !coverageOk) {
-      await appendLog(`⏸️ 사라진 예약 ${goneNew.length}건 취소 표시 보류 — ${!freshOk ? '최신 데이터가 아님' : '범위를 빠짐없이 읽지 못함'}`);
-    } else if (goneNew.length > limit) {
-      await appendLog(`⚠️ 사라진 예약이 ${goneNew.length}건으로 너무 많아(기준 ${limit}건) 취소 표시를 보류합니다 — 바디코디 화면이 제대로 읽혔는지 확인이 필요합니다`);
-    } else {
-      for (const p of gonePlan) { claimed.add(ck(p.calId, p.g)); cancelPlan.push(p); }
+
+  let goneHeld = 0;
+  const globalHold = !freshOk ? '최신 데이터가 아님'
+    : !coverageOk ? '범위를 빠짐없이 읽지 못함'
+    : timeouts ? `화면 로딩 시간초과 ${timeouts}회`
+    : '';
+  for (const [calId, { plan, customerTotal }] of goneByCal) {
+    const fresh = plan.filter(p => !isCancelMarked(p.g));
+    if (!fresh.length) {
+      // 이미 [취소] 표시된 것은 그대로 (취소 집계에 넣어 📍로 다시 보고되지 않게)
+      for (const p of plan) claimed.add(ck(p.calId, p.g));
+      continue;
     }
+    const label = byCal.get(calId)?.label || calId;
+    const calCoaches = coachesOfCal[calId] || [];
+    const coachLoaded = calCoaches.some(c => loadedCoaches.has(c));
+    const limit = Math.max(5, Math.ceil(customerTotal * 0.5));
+    let hold = globalHold;
+    if (!hold && !coachLoaded) hold = '이 캘린더 강사의 예약이 바디코디 데이터에 하나도 없음 — 강사 필터가 걸려 있을 수 있음';
+    if (!hold && fresh.length > limit) hold = `한꺼번에 ${fresh.length}건(기준 ${limit}건)이라 오판일 수 있음`;
+    if (hold) {
+      goneHeld += fresh.length;
+      await appendLog(`⏸️ ${label}: 바디코디에서 사라진 일정 ${fresh.length}건 취소 표시 보류 — ${hold}`);
+      continue;
+    }
+    for (const p of plan) { claimed.add(ck(p.calId, p.g)); cancelPlan.push(p); }
+  }
+  if (emptyHeld) {
+    goneHeld += emptyHeld;
+    await appendLog(`⏸️ 예약이 0건으로 읽힌 주의 일정 ${emptyHeld}건은 취소 표시 보류 — 연휴가 아니라면 화면 로딩 실패일 수 있음`);
+  }
+  summary.goneHeld = goneHeld;
+  if (_diagnostics?.hiddenCancelCount) {
+    await appendLog(`👁 화면에서 사라진(삭제·취소로 보이는) 예약 ${_diagnostics.hiddenCancelCount}건 → 취소로 처리`);
+  }
+  const missingCoaches = Object.keys(coachCalendarMap).filter(c => !loadedCoaches.has(String(c)));
+  if (missingCoaches.length && loadedCoaches.size) {
+    await appendLog(`ℹ️ 이번 데이터에 예약이 없는 매핑 강사: ${missingCoaches.join(', ')} (휴무가 아니라면 바디코디 화면의 강사 필터를 '전체'로 두세요)`);
   }
 
   // 📍 보고: 짝도 없고 취소 표시 대상도 아닌 고객 일정
@@ -1196,7 +1333,13 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       for (const g of list) {
         if (claimed.has(ck(calId, g)) || !g.start?.dateTime) continue;
         if (!isCustomerGcalEvent(g) || isCancelMarked(g)) continue;
-        summary.orphans.push({ 캘린더: label, 시작: g.start.dateTime, 제목: g.summary || '(제목 없음)' });
+        // ⭐ v1.17.0: 왜 연결되지 않았는지 함께 보고
+        const 사유 = g.extendedProperties?.private?.bcSyncId
+          ? '바디코디에서 사라진 예약 — 이번엔 취소 표시 보류 (로그의 ⏸️ 줄 확인)'
+          : bcExistsFor(g)
+          ? '확장이 만든 적 없는 일정 — 같은 시각에 다른(또는 매핑 안 된) 강사의 예약이 있음'
+          : '확장이 만든 적 없는 일정 — 바디코디에 이 시각·회원의 예약이 없음 (지운 예약이면 직접 정리)';
+        summary.orphans.push({ 캘린더: label, 시작: g.start.dateTime, 제목: g.summary || '(제목 없음)', 사유 });
       }
     }
   }
@@ -1410,7 +1553,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
 
   const alreadyOkCount = (summary.details || []).filter(d => d.사유 === '이미 동기화됨').length;
   if (summary.orphans.length) {
-    await appendLog(`📍 바디코디에 없는 캘린더 고객 일정 ${summary.orphans.length}건 (삭제하지 않음, 팝업 결과에서 확인)`);
+    await appendLog(`📍 바디코디 예약과 연결되지 않은 캘린더 고객 일정 ${summary.orphans.length}건 (그대로 둠, 팝업 결과에서 사유 확인)`);
   }
   await appendLog(
     `✅ 완료 v${version} trig=${trigger} dry=${dryRun} ` +
