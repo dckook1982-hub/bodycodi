@@ -12,6 +12,8 @@
    - 폴더: https://drive.google.com/drive/folders/1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx (ID `1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`)
    - Google Drive MCP `create_file`로 올릴 때: 텍스트 파일은 `textContent`, PNG·BOM이 있는 `.ps1`은 `base64Content`. **반드시 `disableConversionToGoogleType: true`** (빠뜨리면 PNG가 Google 문서로 변환된다).
    - 업로드 후 응답의 `fileSize`가 로컬 바이트 수(`wc -c`)와 같은지 전부 확인한다.
+   - 바뀌지 않은 파일은 이전 버전 폴더에서 `copy_file`로 복사한다 (전사 오류 없음).
+   - 수십 KB 이상의 이미지는 base64를 손으로 옮기다 깨질 수 있다. 업로드가 거부되면 다시 시도하지 말고, 같은 폴더에 "받는 곳" 안내 txt(GitHub 링크·ZIP 경로)를 남긴다.
 6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
 7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다. 첫 업로드만 `store/MAKE-STORE-ZIP.bat`(개인키 포함)을 쓴다. 웹스토어 ID가 다르게 나오면 OAuth 클라이언트 ID가 바뀌므로 스토어용 ZIP의 `oauth2.client_id`만 교체한다.
 
