@@ -15,7 +15,9 @@
    - 바뀌지 않은 파일은 이전 버전 폴더에서 `copy_file`로 복사한다 (전사 오류 없음).
    - 수십 KB 이상의 이미지는 base64를 손으로 옮기다 깨질 수 있다. 업로드가 거부되면 다시 시도하지 말고, 같은 폴더에 "받는 곳" 안내 txt(GitHub 링크·ZIP 경로)를 남긴다.
 6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
-7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다. 첫 업로드만 `store/MAKE-STORE-ZIP.bat`(개인키 포함)을 쓴다. 웹스토어 ID가 다르게 나오면 OAuth 클라이언트 ID가 바뀌므로 스토어용 ZIP의 `oauth2.client_id`만 교체한다.
+7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다.
+   - **웹스토어 항목은 이미 있다**: 이름 "BodyCodi → Google Calendar Sync", 항목 ID `heojbjjphafhlepaopagaejebacclfmc`, 상태 "게시됨 - 미등록". 새 항목을 만들지 말고 이 항목에 새 패키지를 올린다 (`MAKE-STORE-ZIP.bat`·개인키 불필요).
+   - 이 ID는 unpacked ID(`clgekekmmlpiggplilhgagfkepepjelk`)와 달라서 OAuth 클라이언트가 따로 필요하다. 스토어용 ZIP의 `oauth2.client_id`만 그 클라이언트 ID로 바꾼다 (저장소의 `manifest.json`은 그대로).
 
 ## 절대 하지 말 것
 
