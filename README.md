@@ -151,7 +151,7 @@ bodycodi-sync/
 │   ├── STORE-LISTING.md      # 대시보드에 붙여 넣을 문구
 │   ├── PRIVACY.md            # 개인정보처리방침 (대시보드에 이 파일 주소 입력)
 │   ├── MAKE-STORE-ZIP.bat/.ps1  # 첫 업로드용 ZIP 만들기 (ID 유지용 개인키 포함)
-│   └── screenshot-1280x800.png, promo-440x280.png  # 스토어 이미지 (가짜 예시 데이터)
+│   └── screenshot-1280x800.jpg, promo-440x280.jpg  # 스토어 이미지 (가짜 예시 데이터)
 └── README.md           # 이 문서
 ```
 
