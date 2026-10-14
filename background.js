@@ -108,7 +108,7 @@ async function listEventsInRange(token, calendarId, timeMin, timeMax) {
     orderBy: 'startTime',
     maxResults: '2500',
     // extendedProperties는 fields 미지정 시 기본 응답에 포함됨 — 명시적으로 보장
-    fields: 'items(id,summary,description,start,end,extendedProperties,colorId,transparency)'
+    fields: 'items(id,summary,description,start,end,extendedProperties,colorId,transparency,created)'
   });
   const data = await gcalFetch(
     token,
@@ -123,6 +123,18 @@ async function patchEvent(token, calendarId, eventId, body) {
     `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     { method: 'PATCH', body: JSON.stringify(body) }
   );
+}
+
+// ⭐ v1.18.0: 일정 삭제 — 바디코디에서 취소·삭제된 예약, 같은 예약의 중복 일정만 지운다
+//   (구글 캘린더 휴지통에 30일간 남아 복구 가능). 이미 지워진 일정(404/410)은 성공으로 본다.
+async function deleteEvent(token, calendarId, eventId) {
+  const res = await fetch(
+    `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+    { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (res.ok || res.status === 404 || res.status === 410) return true;
+  const text = await res.text();
+  throw new Error(`GCal ${res.status}: ${text}`);
 }
 
 // ⭐ v1.14.0: 캘린더 일정 생성
@@ -143,9 +155,7 @@ async function moveEventToCalendar(token, fromCalendarId, eventId, toCalendarId)
   );
 }
 
-// ⭐ v1.16.0: 취소된 예약 표시 (일정은 지우지 않는다)
-const CANCEL_PREFIX = '[취소] ';
-const CANCEL_COLOR_ID = '8';   // 구글 캘린더 "흑연(회색)"
+// v1.16.0~1.17.0의 [취소] 표시 — v1.18.0부터는 삭제로 바뀌었고, 예전 표시를 알아보거나 복구할 때만 쓴다
 function stripCancelPrefix(title) {
   return String(title || '').replace(/^\s*\[취소\]\s*/, '');
 }
@@ -182,6 +192,44 @@ function memberKeyOfGcal(g) {
 // 캘린더 일정이 "고객 예약"으로 보이는지 (마커가 있거나 제목에 회원번호/이름+연락처)
 function isCustomerGcalEvent(g) {
   return !!(g.extendedProperties?.private?.bcSyncId) || !!memberKeyOfGcal(g);
+}
+// ⭐ v1.18.0: 프로그램명 핵심어 — "02 집중관절관리 3회 12개월" → "집중관절관리"
+//   (바디코디 자체 연동은 회원 정보 없이 "02 집중관절관리 3회차" 같은 제목으로 일정을 만들기도 한다)
+function programCore(program) {
+  return String(program || '')
+    .replace(/^\s*\d+\s*/, '')
+    .replace(/\s*\d+\s*회.*$/, '')
+    .replace(/\s+/g, '')
+    .trim();
+}
+// 삭제 판단용(더 엄격): 회원키가 같거나 회원번호가 제목에 있거나, 회원 정보 없는 제목에 같은 프로그램명
+//   — 성함만 같은 메모(예: "김혜정님대기")는 지우지 않는다
+function sameBookingForDelete(g, bc) {
+  const title = String(g.summary || '');
+  const key = memberKeyOfBc(bc);
+  const gk = memberKeyOfGcal(g);
+  if (gk) return gk === key || !!(bc.memberNo && title.includes(bc.memberNo));
+  if (bc.memberNo && title.includes(bc.memberNo)) return true;
+  const core = programCore(bc.program);
+  return core.length >= 3 && title.replace(/\s+/g, '').includes(core);
+}
+// 같은 예약을 가리키는 일정인지 (회원키가 같거나, 회원번호·성함이 제목에 있거나,
+//   회원 정보가 없는 제목에 같은 프로그램명이 들어 있음)
+function sameBookingTitle(g, bc) {
+  const title = String(g.summary || '');
+  const key = memberKeyOfBc(bc);
+  const gk = memberKeyOfGcal(g);
+  if (key && gk) {
+    return gk === key || !!(bc.memberNo && title.includes(bc.memberNo)) ||
+      !!(bc.memberName && bc.memberName.length >= 2 && title.includes(bc.memberName));
+  }
+  if (bc.memberNo && title.includes(bc.memberNo)) return true;
+  if (!gk && bc.memberName && bc.memberName.length >= 2 && title.includes(bc.memberName)) return true;
+  if (!gk) {
+    const core = programCore(bc.program);
+    if (core.length >= 3 && title.replace(/\s+/g, '').includes(core)) return true;
+  }
+  return false;
 }
 
 // ---------- ⭐ v1.16.0: 최신 데이터를 읽기 위한 "동기화 전용 탭" ----------
@@ -1079,6 +1127,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     cancelled: 0,     // ⭐ v1.16.0: [취소] 표시한 일정 수
     restored: 0,      // ⭐ v1.16.0: [취소] 표시를 되돌린 일정 수
     calMoved: 0,      // ⭐ v1.16.0: 담당 강사 변경으로 다른 캘린더로 옮긴 일정 수
+    dedup: 0,         // ⭐ v1.18.0: 지운 중복 일정 수 (cancelled = 취소·삭제 반영으로 지운 일정 수)
     skipped: 0,
     failed: 0,
     details: [],
@@ -1139,6 +1188,25 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
   const take = (bc, calId, g) => { matchOf.set(bc, { g, calId }); claimed.add(ck(calId, g)); };
 
+  // ⭐ v1.18.0: 바디코디 데이터에 같은 캘린더·같은 시각(±3분)·같은 회원 예약이 2건 이상이면 1건만 반영
+  //   (취소 후 다시 잡은 예약의 옛 기록이 상태값 없이 남아 있는 경우 등 — 일정이 2개 생기는 원인)
+  //   캘린더에 이미 예약번호가 연결된 쪽을 남긴다.
+  for (const [calId, grp] of byCal) {
+    const kept = [];
+    for (const bc of grp.active) {
+      const t = tsOf(bc.start), key = memberKeyOfBc(bc);
+      const twin = (t !== null && key) ? kept.find(k => memberKeyOfBc(k) === key && Math.abs((tsOf(k.start) ?? 0) - t) <= 3 * 60 * 1000) : null;
+      if (!twin) { kept.push(bc); continue; }
+      const hasMarker = (x) => (markerIndex.get(x.id) || []).some(h => h.calId === calId);
+      const keep = (!hasMarker(twin) && hasMarker(bc)) ? bc : twin;
+      const drop = keep === bc ? twin : bc;
+      if (keep === bc) kept[kept.indexOf(twin)] = bc;
+      activeIds.delete(drop.id);
+      await appendLog(`⚠️ 바디코디에 같은 회원·같은 시각 예약이 2건 (${(drop.memberNo || '')} ${drop.memberName || ''} ${hhmm(drop.start)}, 예약번호 ${keep.id}·${drop.id}) — 1건만 캘린더에 반영`);
+    }
+    grp.active = kept;
+  }
+
   // 1차) 같은 캘린더의 예약번호 마커 / 레거시 태그
   for (const [calId, grp] of byCal) {
     const list = gcalByCal.get(calId) || [];
@@ -1170,8 +1238,10 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         if (claimed.has(ck(calId, g))) return false;
         const gs = tsOf(g.start?.dateTime || g.start?.date);
         if (gs === null || Math.abs(gs - bcStart) > 3 * 60 * 1000) return false;
+        // ⭐ v1.18.0: 같은 예약으로 보이는 일정만 (회원번호·성함·프로그램명) — "가족일정" 같은 개인 일정은 제외
         const gNo = memberNoInTitle(g.summary);
-        return !gNo || !bc.memberNo || gNo === bc.memberNo;
+        if (gNo && bc.memberNo && gNo !== bc.memberNo) return false;
+        return sameBookingTitle(g, bc);
       });
       if (m) take(bc, calId, m);
     }
@@ -1204,25 +1274,31 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   //   (가) 바디코디에서 "취소" 상태인 예약의 일정 — 예약번호 마커, 없으면 같은 시각·같은 회원번호
   //   (나) 예약번호 마커가 있는데 바디코디 어디에도 그 예약이 없는 일정 (삭제됐거나 4주 밖으로 옮겨짐)
   //        → 최신 데이터로 범위 전체를 빠짐없이 읽었을 때만, 그리고 한꺼번에 너무 많으면 보류
-  const cancelPlan = [];   // { calId, g, reason, bc? }
+  const cancelPlan = [];   // { calId, g, reason, bc? }  — ⭐ v1.18.0: 실행 시 삭제
+  const dupPlan = [];      // ⭐ v1.18.0: { calId, g, bc } — 같은 예약의 중복 일정 (1개만 남기고 삭제)
   const CANCEL_REASON = { status: '바디코디에서 취소됨', hidden: '바디코디 화면에서 사라짐(삭제·취소)' };
   const WIN = 3 * 60 * 1000;
+  // 다른 (살아 있는) 예약의 예약번호가 박힌 일정은 건드리지 않는다
+  const ownedByOtherActive = (g, bcId) => {
+    const sid = g.extendedProperties?.private?.bcSyncId;
+    return !!(sid && sid !== bcId && activeIds.has(sid));
+  };
+  const slotTwins = (list, calId, bc) => {
+    const bcStart = tsOf(bc.start);
+    if (bcStart === null) return [];
+    return list.filter(g => {
+      if (claimed.has(ck(calId, g)) || ownedByOtherActive(g, bc.id)) return false;
+      const gs = tsOf(g.start?.dateTime);
+      return gs !== null && Math.abs(gs - bcStart) <= WIN && sameBookingForDelete(g, bc);
+    });
+  };
   for (const [calId, grp] of byCal) {
     const list = gcalByCal.get(calId) || [];
     for (const bc of grp.cancelled) {
-      const bcStart = tsOf(bc.start);
-      const key = memberKeyOfBc(bc);
-      const m =
-        list.find(g => !claimed.has(ck(calId, g)) && bc.id && g.extendedProperties?.private?.bcSyncId === bc.id) ||
-        list.find(g => {
-          if (claimed.has(ck(calId, g)) || bcStart === null || !key) return false;
-          // 다른 (살아 있는) 예약의 마커가 박힌 일정은 건드리지 않는다
-          const sid = g.extendedProperties?.private?.bcSyncId;
-          if (sid && sid !== bc.id && activeIds.has(sid)) return false;
-          const gs = tsOf(g.start?.dateTime);
-          return gs !== null && Math.abs(gs - bcStart) <= WIN && memberKeyOfGcal(g) === key;
-        });
-      if (m) {
+      // 예약번호 마커로 연결된 일정 + 같은 시각·같은 회원(또는 같은 프로그램)의 일정 전부
+      const hits = list.filter(g => !claimed.has(ck(calId, g)) && bc.id && g.extendedProperties?.private?.bcSyncId === bc.id);
+      for (const g of slotTwins(list, calId, bc)) if (!hits.includes(g)) hits.push(g);
+      for (const m of hits) {
         claimed.add(ck(calId, m));
         cancelPlan.push({ calId, g: m, reason: CANCEL_REASON[bc.cancelReason] || CANCEL_REASON.status, bc });
       }
@@ -1281,7 +1357,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       const sid = g.extendedProperties?.private?.bcSyncId;
       if (!sid || allBcIds.has(sid)) continue;
       const p = { calId, g, reason: '바디코디에서 사라짐' };
-      if (!isCancelMarked(g) && inEmptyView(g)) { emptyHeld++; claimed.add(ck(calId, g)); continue; }
+      if (inEmptyView(g)) { emptyHeld++; claimed.add(ck(calId, g)); continue; }
       plan.push(p);
     }
     goneByCal.set(calId, { plan, customerTotal });
@@ -1293,12 +1369,9 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     : timeouts ? `화면 로딩 시간초과 ${timeouts}회`
     : '';
   for (const [calId, { plan, customerTotal }] of goneByCal) {
+    if (!plan.length) continue;
+    // ⭐ v1.18.0: 예전 버전이 [취소] 표시만 해 둔 일정도 이번에 함께 삭제 (보류 조건은 동일)
     const fresh = plan.filter(p => !isCancelMarked(p.g));
-    if (!fresh.length) {
-      // 이미 [취소] 표시된 것은 그대로 (취소 집계에 넣어 📍로 다시 보고되지 않게)
-      for (const p of plan) claimed.add(ck(p.calId, p.g));
-      continue;
-    }
     const label = byCal.get(calId)?.label || calId;
     const calCoaches = coachesOfCal[calId] || [];
     const coachLoaded = calCoaches.some(c => loadedCoaches.has(c));
@@ -1307,15 +1380,15 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     if (!hold && !coachLoaded) hold = '이 캘린더 강사의 예약이 바디코디 데이터에 하나도 없음 — 강사 필터가 걸려 있을 수 있음';
     if (!hold && fresh.length > limit) hold = `한꺼번에 ${fresh.length}건(기준 ${limit}건)이라 오판일 수 있음`;
     if (hold) {
-      goneHeld += fresh.length;
-      await appendLog(`⏸️ ${label}: 바디코디에서 사라진 일정 ${fresh.length}건 취소 표시 보류 — ${hold}`);
+      goneHeld += plan.length;
+      await appendLog(`⏸️ ${label}: 바디코디에서 사라진 일정 ${plan.length}건 삭제 보류 — ${hold}`);
       continue;
     }
     for (const p of plan) { claimed.add(ck(p.calId, p.g)); cancelPlan.push(p); }
   }
   if (emptyHeld) {
     goneHeld += emptyHeld;
-    await appendLog(`⏸️ 예약이 0건으로 읽힌 주의 일정 ${emptyHeld}건은 취소 표시 보류 — 연휴가 아니라면 화면 로딩 실패일 수 있음`);
+    await appendLog(`⏸️ 예약이 0건으로 읽힌 주의 일정 ${emptyHeld}건은 삭제 보류 — 연휴가 아니라면 화면 로딩 실패일 수 있음`);
   }
   summary.goneHeld = goneHeld;
   if (_diagnostics?.hiddenCancelCount) {
@@ -1324,6 +1397,22 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   const missingCoaches = Object.keys(coachCalendarMap).filter(c => !loadedCoaches.has(String(c)));
   if (missingCoaches.length && loadedCoaches.size) {
     await appendLog(`ℹ️ 이번 데이터에 예약이 없는 매핑 강사: ${missingCoaches.join(', ')} (휴무가 아니라면 바디코디 화면의 강사 필터를 '전체'로 두세요)`);
+  }
+
+  // ⭐ v1.18.0: 중복 정리 — 살아 있는 예약 1건에 캘린더 일정이 여러 개면 연결된 1개만 남기고 나머지 삭제
+  //   주 원인: 확장이 먼저 일정을 만든 뒤 바디코디 자체 구글 캘린더 연동이 몇 분 늦게 같은 예약 일정을 또 만듦
+  //   (연동 일정 제목 예: "23-027 장우성_010-…_기본관절관리 - 기본관절관리", "02 집중관절관리 3회차")
+  for (const [calId, grp] of byCal) {
+    const list = gcalByCal.get(calId) || [];
+    for (const bc of grp.active) {
+      const kept = matchOf.get(bc);
+      if (!kept) continue;
+      for (const g of slotTwins(list, calId, bc)) {
+        if (g === kept.g) continue;
+        claimed.add(ck(calId, g));
+        dupPlan.push({ calId, g, bc, keptTitle: kept.g.summary || '' });
+      }
+    }
   }
 
   // 📍 보고: 짝도 없고 취소 표시 대상도 아닌 고객 일정
@@ -1335,7 +1424,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         if (!isCustomerGcalEvent(g) || isCancelMarked(g)) continue;
         // ⭐ v1.17.0: 왜 연결되지 않았는지 함께 보고
         const 사유 = g.extendedProperties?.private?.bcSyncId
-          ? '바디코디에서 사라진 예약 — 이번엔 취소 표시 보류 (로그의 ⏸️ 줄 확인)'
+          ? '바디코디에서 사라진 예약 — 이번엔 삭제 보류 (로그의 ⏸️ 줄 확인)'
           : bcExistsFor(g)
           ? '확장이 만든 적 없는 일정 — 같은 시각에 다른(또는 매핑 안 된) 강사의 예약이 있음'
           : '확장이 만든 적 없는 일정 — 바디코디에 이 시각·회원의 예약이 없음 (지운 예약이면 직접 정리)';
@@ -1345,7 +1434,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
 
   // ---------- 3단계: 실행 ----------
-  const totalToProcess = activeEvents.length + cancelPlan.length;
+  const totalToProcess = activeEvents.length + cancelPlan.length + dupPlan.length;
   let processed = 0;
   const bumpProgress = (label) => {
     if (totalToProcess === 0) return;
@@ -1403,13 +1492,32 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         }
         const det = { 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: false, 변경예정: true, 생성: true, 새제목: createTitle };
         if (dryRun) { summary.details.push(det); continue; }
+        // ⭐ v1.18.0: 만들기 직전에 그 시각을 다시 확인 — 다른 PC나 바디코디 자체 연동이 방금 만든 일정이 있으면 그걸 쓴다
+        try {
+          const fresh = await listEventsInRange(token, calId, new Date(startTs - WIN), new Date(startTs + WIN));
+          const twin = fresh.find(g => {
+            const gs = tsOf(g.start?.dateTime);
+            return gs !== null && Math.abs(gs - startTs) <= WIN && !ownedByOtherActive(g, bc.id) && sameBookingTitle(g, bc);
+          });
+          if (twin) {
+            await patchEvent(token, calId, twin.id, {
+              summary: createTitle,
+              description: buildDescription(bc, twin.description),
+              extendedProperties: { private: { bcSyncId: bc.id } }
+            });
+            summary.matched++; summary.updated++;
+            summary.details.push({ 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: true, 변경예정: true, 완료: true, 기존제목: twin.summary, 새제목: createTitle });
+            await appendLog(`🔗 ${memberLabel}: 방금 생긴 같은 예약 일정("${twin.summary}")을 연결 — 새로 만들지 않음`);
+            continue;
+          }
+        } catch (e) { /* 재확인 실패 시 그대로 생성 (다음 동기화의 중복 정리가 처리) */ }
         try {
           await insertEvent(token, calId, {
             summary: createTitle,
             description: buildDescription(bc, ''),
             start: { dateTime: bc.start, timeZone: 'Asia/Seoul' },
             end:   { dateTime: endIso,   timeZone: 'Asia/Seoul' },
-            extendedProperties: { private: { bcSyncId: bc.id } }
+            extendedProperties: { private: { bcSyncId: bc.id, bcCreated: '1' } }
           });
           summary.created++;
           summary.details.push({ ...det, 완료: true });
@@ -1524,29 +1632,37 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     }
   }
 
-  // ⭐ v1.16.0: 취소 표시 실행 — 일정은 지우지 않고 제목 앞에 [취소], 회색, "한가함"으로 바꾼다
-  for (const p of cancelPlan) {
+  // ⭐ v1.18.0: 삭제 실행 — 바디코디에서 취소·삭제된 예약의 일정, 같은 예약의 중복 일정
+  //   최신 데이터(동기화 전용 새 탭)로 읽었을 때만 지운다. 지운 일정은 구글 캘린더 휴지통에서 30일간 복구 가능.
+  const deletions = [
+    ...cancelPlan.map(p => ({ ...p, kind: 'cancel' })),
+    ...dupPlan.map(p => ({ ...p, kind: 'dup', reason: '같은 예약의 중복 일정' }))
+  ];
+  if (deletions.length && !freshOk) {
+    summary.goneHeld = (summary.goneHeld || 0) + deletions.length;
+    await appendLog(`⏸️ 삭제 ${deletions.length}건 보류 — 최신 데이터가 아님 (바디코디 로그인 확인 후 다시 동기화하세요)`);
+  }
+  for (const p of (freshOk ? deletions : [])) {
     processed++;
     const g = p.g;
     const label = byCal.get(p.calId)?.label || p.calId;
-    bumpProgress(`${processed}/${totalToProcess} 취소 표시`);
-    if (isCancelMarked(g) && String(g.summary || '').startsWith(CANCEL_PREFIX)) continue;   // 이미 표시됨
-    const det = { 시작: g.start?.dateTime, 회원: stripCancelPrefix(g.summary || ''), 캘린더: label, 취소: p.reason, 변경예정: true };
+    bumpProgress(`${processed}/${totalToProcess} ${p.kind === 'dup' ? '중복 정리' : '취소 반영'}`);
+    const name = stripCancelPrefix(g.summary || '');
+    const det = p.kind === 'dup'
+      ? { 시작: g.start?.dateTime, 회원: name, 캘린더: label, 중복: p.keptTitle ? `남긴 일정: ${p.keptTitle}` : '같은 예약의 다른 일정을 남김', 변경예정: true }
+      : { 시작: g.start?.dateTime, 회원: name, 캘린더: label, 취소: p.reason, 변경예정: true };
     if (dryRun) { summary.details.push(det); continue; }
     try {
-      const priv = { bcSyncId: g.extendedProperties?.private?.bcSyncId || p.bc?.id || '', bcCancelled: '1', bcPrevColor: g.colorId || '' };
-      await patchEvent(token, p.calId, g.id, {
-        summary: CANCEL_PREFIX + stripCancelPrefix(g.summary || ''),
-        colorId: CANCEL_COLOR_ID,
-        transparency: 'transparent',
-        extendedProperties: { private: priv }
-      });
-      summary.cancelled++;
+      await deleteEvent(token, p.calId, g.id);
+      if (p.kind === 'dup') summary.dedup = (summary.dedup || 0) + 1;
+      else summary.cancelled++;
       summary.details.push({ ...det, 완료: true });
-      await appendLog(`🚫 ${stripCancelPrefix(g.summary || '')}: ${p.reason} → 캘린더에 [취소] 표시 (${hhmm(g.start?.dateTime)}, 삭제 안 함)`);
+      await appendLog(p.kind === 'dup'
+        ? `🧹 ${name}: 같은 예약의 중복 일정 삭제 (${hhmm(g.start?.dateTime)}, ${label})`
+        : `🗑️ ${name}: ${p.reason} → 캘린더 일정 삭제 (${hhmm(g.start?.dateTime)}, ${label})`);
     } catch (err) {
       summary.failed++;
-      await appendLog(`❌ 취소 표시 실패: ${err.message}`);
+      await appendLog(`❌ 삭제 실패: ${err.message}`);
       summary.details.push({ ...det, 실패: err.message });
     }
   }
@@ -1557,7 +1673,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
   await appendLog(
     `✅ 완료 v${version} trig=${trigger} dry=${dryRun} ` +
-    `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 생성=${summary.created} 취소표시=${summary.cancelled} 복구=${summary.restored} 강사이동=${summary.calMoved} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
+    `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 생성=${summary.created} 취소삭제=${summary.cancelled} 중복삭제=${summary.dedup || 0} 복구=${summary.restored} 강사이동=${summary.calMoved} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
   );
   reportProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
   return { summary };
@@ -1790,6 +1906,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     return;
   }
 
+  // ⭐ v1.18.0: 여러 PC가 같은 시각에 동시에 돌면 같은 예약을 서로 만들 수 있어 0~20초 흩어서 시작
+  await sleep(Math.floor(Math.random() * 20000));
   try {
     await runSync({ trigger: `alarm:${alarm.name}`, dryRun: false });
   } catch (err) {
