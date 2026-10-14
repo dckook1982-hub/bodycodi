@@ -71,16 +71,12 @@ before an unconditional update cannot substitute for compare-and-swap. It cannot
 operate this implementation's shared lock or protect a manual note edited in the
 gap between read and write. No production lock is claimed.
 
-**Single writer instead of a lock:** this would require verified cessation of
-every PC mutation path, every other automation and native BodyCodi update to the
-same events, plus enforced exclusion of concurrent manual edits to the fields
-being replaced. One script must have proven serialization, including delayed
-requests and crash recovery. Turning a PC off, selecting a 30-minute interval,
-or setting a Boolean is not evidence of ownership. Since staff notes are editable
-on the current calendars, this alternative is not currently verified and is not
-a drop-in solution. Making calendars exclusive/read-only or relocating notes
-changes access/workflows and needs explicit approval. We do not recommend this
-as an implicit workaround for the missing conditional-write capability.
+**Exclusive-writer alternative rejected for the current workflow:** staff must
+remain able to edit their calendars. Serializing one automation, turning a PC off,
+or setting a Boolean cannot prevent concurrent manual edits. Retain conditional
+writes; do not promise exclusive ownership or require staff to stop editing as a
+workaround. See [the runtime decision](runtime-decision.md) for the two retained
+options and their minimum persistent permissions.
 
 **Conditional-write bridge if the existing connector cannot provide it:** a
 user-owned Google Apps Script project is a documented cloud runtime candidate.
