@@ -67,7 +67,7 @@ document.getElementById('toggleResult').addEventListener('click', () => {
 function showResult(details, dryRun, orphans) {
   const list = details || [];
   const actionCount =
-    list.filter(d => d.사유 !== '이미 동기화됨' && (d.실패 || d.생성 || d.시간이동 || d.취소 || d.강사이동 ||
+    list.filter(d => d.사유 !== '이미 동기화됨' && (d.실패 || d.생성 || d.시간이동 || d.취소 || d.중복 || d.강사이동 ||
       d.매칭 === false || d.완료 || (dryRun && d.변경예정))).length + (orphans || []).length;
   document.getElementById('resultBox').textContent = renderResult(details, dryRun, orphans);
   document.getElementById('resultTitle').textContent = actionCount > 0
@@ -207,9 +207,10 @@ function renderResult(details, dryRun, orphans) {
 
   const failed    = list.filter(d => d.실패);
   const cancelled = list.filter(d => d.취소 && !d.실패);                         // ⭐ v1.16.0
+  const dups      = list.filter(d => d.중복 && !d.실패);                         // ⭐ v1.18.0
   const coachMv   = list.filter(d => d.강사이동 && !d.취소 && !d.실패);           // ⭐ v1.16.0
   const restored  = list.filter(d => d.복구 && !d.강사이동 && !d.취소 && !d.실패); // ⭐ v1.16.0
-  const rest      = list.filter(d => !d.취소 && !d.강사이동 && !d.복구);
+  const rest      = list.filter(d => !d.취소 && !d.중복 && !d.강사이동 && !d.복구);
   const created = rest.filter(d => d.생성 && !d.실패);
   const moved   = rest.filter(d => d.시간이동 && !d.실패);
   const updated = rest.filter(d => !d.생성 && !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
@@ -218,7 +219,7 @@ function renderResult(details, dryRun, orphans) {
   const alreadyOk = list.filter(d => d.사유 === '이미 동기화됨').length;
   const orphanList = orphans || [];
 
-  if (!failed.length && !cancelled.length && !coachMv.length && !restored.length && !created.length && !moved.length && !updated.length && !skipped.length && !orphanList.length) {
+  if (!failed.length && !cancelled.length && !dups.length && !coachMv.length && !restored.length && !created.length && !moved.length && !updated.length && !skipped.length && !orphanList.length) {
     return `✅ 조치가 필요한 항목이 없습니다.\n   (${alreadyOk}건 모두 이미 동기화된 상태)`;
   }
 
@@ -233,8 +234,11 @@ function renderResult(details, dryRun, orphans) {
   addSection('❌', '실패', failed, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.실패}`);
 
-  addSection('🚫', dryRun ? '취소로 표시할 예정 (삭제하지 않음)' : '취소로 표시함 — 제목 앞 [취소], 회색 (삭제하지 않음)', cancelled, d =>
+  addSection('🗑️', dryRun ? '바디코디에서 취소·삭제된 예약 — 캘린더에서 지울 예정' : '바디코디에서 취소·삭제된 예약 — 캘린더에서 지움 (휴지통 30일 보관)', cancelled, d =>
     `   · ${fmtWhen(d.시작)}  ${d.회원 || ''}\n     ${d.취소}${d.캘린더 ? ` [${d.캘린더}]` : ''}`);
+
+  addSection('🧹', dryRun ? '같은 예약의 중복 일정 — 1개만 남기고 지울 예정' : '같은 예약의 중복 일정 — 1개만 남기고 지움', dups, d =>
+    `   · ${fmtWhen(d.시작)}  ${d.회원 || ''}${d.캘린더 ? ` [${d.캘린더}]` : ''}\n     ${d.중복}`);
 
   addSection('🔀', dryRun ? '담당 강사 변경 — 캘린더 옮길 예정' : '담당 강사 변경 — 캘린더 옮김', coachMv, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.강사이동}${d.시간이동 ? ` · ${d.시간이동}` : ''}`);
@@ -292,8 +296,10 @@ function runSync(dryRun) {
     const createdText = createdCount > 0 ? ` · 🆕생성=${createdCount}` : '';
     const cancelCount = dryRun ? (s.details || []).filter(d => d.취소).length : (s.cancelled || 0);
     const coachMvCount = dryRun ? (s.details || []).filter(d => d.강사이동).length : (s.calMoved || 0);
-    const extraText = (cancelCount ? ` · 🚫취소=${cancelCount}` : '') + (coachMvCount ? ` · 🔀강사변경=${coachMvCount}` : '') +
-      (s.goneHeld ? ` · ⏸️취소보류=${s.goneHeld}(로그 확인)` : '');   // ⭐ v1.17.0
+    const dupCount = dryRun ? (s.details || []).filter(d => d.중복).length : (s.dedup || 0);
+    const extraText = (cancelCount ? ` · 🗑️취소삭제=${cancelCount}` : '') + (dupCount ? ` · 🧹중복삭제=${dupCount}` : '') +
+      (coachMvCount ? ` · 🔀강사변경=${coachMvCount}` : '') +
+      (s.goneHeld ? ` · ⏸️삭제보류=${s.goneHeld}(로그 확인)` : '');   // ⭐ v1.17.0
 
     setStatus(
       dryRun

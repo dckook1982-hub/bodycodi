@@ -1,6 +1,6 @@
 # 개인정보처리방침 — BodyCodi → Google Calendar Sync
 
-시행일: 2026-10-12
+시행일: 2026-10-14
 
 이 크롬 확장 프로그램(이하 "확장")은 바디코디(crm.bodycodi.com) 예약 화면의 정보를 사용자의 구글 캘린더에 옮겨 적는 업무용 도구입니다. 센터 직원이 자기 센터의 예약을 관리할 목적으로만 사용합니다.
 
@@ -25,7 +25,7 @@
 
 - 정보를 판매하거나 광고·마케팅·신용 평가 목적으로 쓰지 않습니다.
 - 분석 도구, 추적 코드, 외부 스크립트를 넣지 않습니다.
-- 구글 캘린더 일정을 삭제하지 않습니다.
+- 구글 캘린더 일정은 두 경우에만 삭제합니다: 바디코디에서 취소·삭제된 예약의 일정, 같은 예약의 중복 일정. 회원 정보가 없는 개인 일정은 삭제하지 않습니다. 삭제된 일정은 구글 캘린더 휴지통에서 30일간 복구할 수 있습니다.
 
 ## 4. Google API 사용자 데이터 정책 준수
 
@@ -39,4 +39,4 @@
 
 ## Privacy Policy (English summary)
 
-This extension reads appointment data (member number, name, phone, program, time, coach, session counts, membership expiry) from the BodyCodi schedule page the user has open, and writes it only to the user's own Google Calendar through the Google Calendar API. No data is sent to the developer or any third-party server. Settings and a short activity log are stored locally in the browser (chrome.storage.local) and are removed when the extension is uninstalled. Data is never sold, never used for advertising or creditworthiness, and never used for purposes unrelated to the extension's single purpose. Use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.
+This extension reads appointment data (member number, name, phone, program, time, coach, session counts, membership expiry) from the BodyCodi schedule page the user has open, and writes it only to the user's own Google Calendar through the Google Calendar API. It deletes a calendar event only when the booking was cancelled or deleted in BodyCodi, or when the event duplicates another event for the same booking. No data is sent to the developer or any third-party server. Settings and a short activity log are stored locally in the browser (chrome.storage.local) and are removed when the extension is uninstalled. Data is never sold, never used for advertising or creditworthiness, and never used for purposes unrelated to the extension's single purpose. Use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.
