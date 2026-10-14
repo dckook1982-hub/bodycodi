@@ -347,20 +347,24 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
         //   - 각 화면에서는 그 화면 구간에 시작하는 예약만 취한다 → 다른 주의 묵은 캐시가 섞이지 않음.
         const DAY = 86400000;
         // navStart: 화면을 넘기기 직전 시각. 그 뒤에 시작된 요청만 기다린다.
+        //   ⭐ v1.18.1: 최대 15초(예전 10초). 시간초과면 끝나지 않은 요청 경로를 기록해 둔다(원인 진단용).
+        const timeoutPaths = new Set();
         const settle = async (navStart) => {
           await new Promise(r => setTimeout(r, 450));
           if (typeof window.__bcNetActivity !== 'function') {
             await new Promise(r => setTimeout(r, 2050));
             return 'fixed';
           }
-          while (Date.now() - navStart < 10000) {
-            const a = window.__bcNetActivity(navStart);
+          let a = null;
+          while (Date.now() - navStart < 15000) {
+            a = window.__bcNetActivity(navStart);
             if (a.busy === 0) {
               // 요청이 하나도 없었으면(캐시로 그림) 0.9초, 있었으면 마지막 완료 후 0.5초 더 기다림
               if (a.started === 0 ? Date.now() - navStart >= 900 : Date.now() - a.lastEnd >= 500) return 'net';
             }
             await new Promise(r => setTimeout(r, 150));
           }
+          for (const p of (a && a.pending) || []) if (timeoutPaths.size < 5) timeoutPaths.add(String(p));
           return 'timeout';
         };
         const evStartMs = (ev) => {
@@ -386,7 +390,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
 
           if (!origDate || typeof scheduler.setCurrentView !== 'function') {
             const evs = scheduler.getEvents();
-            return { events: evs, prefetched: false, complete: false, views: [], hiddenCount: 0, hiddenCancelCount: 0, waitModes: [], hiddenIds: new Set(), hiddenCancelIds: new Set() };
+            return { events: evs, prefetched: false, complete: false, views: [], hiddenCount: 0, hiddenCancelCount: 0, waitModes: [], hiddenIds: new Set(), hiddenCancelIds: new Set(), timeoutPaths: [] };
           }
 
           // 사용자 탭에서 읽는 경우: 지금 보고 있는 주를 다시 받아오게 하려고 먼저 범위 밖으로 한 번 이동
@@ -420,11 +424,12 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
           let complete = false;
           for (let guard = 0; guard < 45; guard++) {
             if (cursor > RANGE_END_MS) { complete = true; break; }
-            let vmin = null, vmax = null, got = [];
+            let vmin = null, vmax = null, got = [], wait = '';
             try {
               const navStart = Date.now();
               scheduler.setCurrentView(new Date(cursor), origMode);
-              waitModes.push(await settle(navStart));
+              wait = await settle(navStart);
+              waitModes.push(wait);
               const st = scheduler.getState() || {};
               vmin = st.min_date ? new Date(st.min_date).getTime() : null;
               vmax = st.max_date ? new Date(st.max_date).getTime() : null;
@@ -484,7 +489,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
                 }
               }
             }
-            views.push({ from: vmin, to: vmax, count: inView.length, rendered: renderedInView, reliable: domWorks });
+            views.push({ from: vmin, to: vmax, count: inView.length, rendered: renderedInView, reliable: domWorks, wait });
             cursor = vmax;
           }
 
@@ -496,7 +501,8 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
           }
           return {
             events: Array.from(byId.values()), prefetched: true, complete, views,
-            hiddenCount: domSeen ? hiddenCount : null, hiddenCancelCount, waitModes, hiddenIds, hiddenCancelIds
+            hiddenCount: domSeen ? hiddenCount : null, hiddenCancelCount, waitModes, hiddenIds, hiddenCancelIds,
+            timeoutPaths: [...timeoutPaths]
           };
         };
 
@@ -864,7 +870,8 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
                 weeks: WEEKS,
                 weekCounts,
                 views: _prefetch.views,
-                waitModes: _prefetch.waitModes
+                waitModes: _prefetch.waitModes,
+                timeoutPaths: _prefetch.timeoutPaths || []
               },
               statusDist: _statusDist,
               hiddenCount: _prefetch.hiddenCount,
@@ -1061,6 +1068,9 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       const waitTxt = waits.includes('net') ? '요청완료 확인' : (waits.includes('fixed') ? '고정대기' : '-');
       const toTxt = waits.filter(w => w === 'timeout').length;
       await appendLog(`🔁 ${SYNC_WEEKS}주 프리페치: ${perWeek} (병합 후 ${events.length}건, 화면 ${(pf.views || []).length}개, 로딩=${waitTxt}${toTxt ? `, 시간초과 ${toTxt}회` : ''}${pf.complete ? '' : ', ⚠️범위 일부 못 읽음'})`);
+      if (toTxt && (pf.timeoutPaths || []).length) {
+        await appendLog(`⏳ 시간초과 때 끝나지 않은 바디코디 요청: ${pf.timeoutPaths.join(', ')}`);
+      }
     } else {
       await appendLog(`⚠️ ${SYNC_WEEKS}주 프리페치 미시도 — scheduler.setCurrentView 사용 불가. 현재 보이는 주만 동기화됩니다.`);
     }
@@ -1308,9 +1318,21 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   // ⭐ v1.17.0: "바디코디에서 사라진 일정" 판정 — 캘린더마다 따로 본다
   //   대상: 예약번호 마커가 있는데 그 예약이 바디코디 데이터 어디에도 없음
   //   (마커 없는 일정 = 확장이 만든 적 없는 일정은 표시하지 않고 📍로 보고만 — 사유를 함께 적는다)
-  //   보류: 최신 데이터가 아님 / 범위를 다 못 읽음 / 화면 로딩 시간초과 /
-  //         그 캘린더의 강사 예약이 이번 데이터에 하나도 없음(강사 필터 등) / 그 캘린더 고객 일정의 절반 넘게 사라짐
-  const timeouts = (pf.waitModes || []).filter(w => w === 'timeout').length;
+  //   보류: 최신 데이터가 아님 / 그 캘린더의 강사 예약이 이번 데이터에 하나도 없음(강사 필터 등) /
+  //         그 캘린더 고객 일정의 절반 넘게 사라짐
+  //   ⭐ v1.18.1: 화면 로딩 시간초과·못 읽은 주는 "그 주의 일정만" 보류 (예전: 한 번만 시간초과여도 4주 전체 보류
+  //         → 바디코디에서 지운 예약 일정이 계속 남는 원인이 될 수 있었음)
+  const pfViews = pf.views || [];
+  const coveredUntil = pf.complete ? Infinity
+    : pfViews.filter(v => !v.error && v.to > v.from).reduce((m, v) => Math.max(m, v.to), -Infinity);
+  const viewHoldOf = (g) => {
+    const t = tsOf(g.start?.dateTime);
+    if (t === null) return '시각 없음';
+    if (pfViews.some(v => v.wait === 'timeout' && t >= v.from && t < v.to)) return '그 주 화면 로딩 시간초과';
+    if (t >= coveredUntil) return '그 주 화면을 읽지 못함';
+    return '';
+  };
+  const viewHeld = {};   // 사유 → 건수
   const loadedCoaches = new Set(events.map(e => e.coachId).filter(Boolean).map(String));
   const coachesOfCal = {};
   for (const [cid, cal] of Object.entries(coachCalendarMap)) (coachesOfCal[cal] ||= []).push(String(cid));
@@ -1358,6 +1380,8 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       if (!sid || allBcIds.has(sid)) continue;
       const p = { calId, g, reason: '바디코디에서 사라짐' };
       if (inEmptyView(g)) { emptyHeld++; claimed.add(ck(calId, g)); continue; }
+      const vh = viewHoldOf(g);
+      if (vh) { viewHeld[vh] = (viewHeld[vh] || 0) + 1; continue; }   // 📍에 보류 사유와 함께 보고
       plan.push(p);
     }
     goneByCal.set(calId, { plan, customerTotal });
@@ -1365,8 +1389,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
 
   let goneHeld = 0;
   const globalHold = !freshOk ? '최신 데이터가 아님'
-    : !coverageOk ? '범위를 빠짐없이 읽지 못함'
-    : timeouts ? `화면 로딩 시간초과 ${timeouts}회`
+    : !pf.attempted ? '범위를 빠짐없이 읽지 못함'
     : '';
   for (const [calId, { plan, customerTotal }] of goneByCal) {
     if (!plan.length) continue;
@@ -1385,6 +1408,10 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       continue;
     }
     for (const p of plan) { claimed.add(ck(p.calId, p.g)); cancelPlan.push(p); }
+  }
+  for (const [why, n] of Object.entries(viewHeld)) {
+    goneHeld += n;
+    await appendLog(`⏸️ 바디코디에서 사라진 일정 ${n}건 삭제 보류 — ${why} (나머지 주는 정상 반영, 다음 동기화 때 다시 확인)`);
   }
   if (emptyHeld) {
     goneHeld += emptyHeld;
