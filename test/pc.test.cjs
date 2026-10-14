@@ -36,8 +36,8 @@ test('actual scheduler extraction never interprets useNumber or aggregate badge 
   assert.equal(extracted.events[0].totalCount, null); assert.equal(extracted.events[0].remainCount, null);
   assert.equal(extracted.events[0].countStatus, 'unverified-scheduler-pass-mapping');
 });
-test('actual PC runSync after cloud enrichment preserves counts and manual notes', async () => {
-  const { ctx } = pcContext();
+for (const mode of ['legacy', 'coordinated']) test(`actual PC runSync (${mode}) preserves corrected counts and notes`, async () => {
+  const { ctx } = pcContext(mode === 'legacy' ? { coordinationEvent: undefined } : { coordinationMode: mode });
   let lock = { id: 'lock', etag: '1', description: JSON.stringify({ schema: 'bodycodi-writer-v1', owner: '' }) };
   let g = { id: 'event', etag: '1', summary: 'old-title', description: '수동 메모\n총횟수 : 39회\n잔여횟수 : 13회',
     start: { dateTime: '2026-10-15T01:00:00Z' }, end: { dateTime: '2026-10-15T02:00:00Z' },
@@ -73,12 +73,18 @@ test('actual PC runSync after cloud enrichment preserves counts and manual notes
   assert.equal((await ctx.runSync()).summary.updated, 0);
   assert.equal(memberWrites.length, 1);
   assert.equal(JSON.parse(lock.description).owner, '');
+  ctx.synthetic.events[0].isAssessment = true;
+  ctx.synthetic.events[0].round = 1;
+  g.summary += ' 3회차'; g.etag = String(Number(g.etag) + 1);
+  assert.equal((await ctx.runSync()).summary.updated, 0);
+  assert.ok(g.summary.endsWith(' 3회차'));
+  assert.equal(memberWrites.length, 1);
   ctx.synthetic._diagnostics.prefetch.complete = false;
   await assert.rejects(ctx.runSync(), /source-not-fresh-complete/);
   assert.equal(memberWrites.length, 1);
 });
-test('PC refuses mutations without configured shared coordination', async () => {
-  const { ctx } = pcContext({ coordinationEvent: undefined });
+test('explicitly coordinated PC refuses missing coordination without legacy fallback', async () => {
+  const { ctx } = pcContext({ coordinationMode: 'coordinated', coordinationEvent: undefined });
   vm.runInContext("getAuthToken = async () => 'synthetic-token';", ctx);
   await assert.rejects(ctx.runSync(), /coordination-not-configured/);
 });
@@ -87,4 +93,33 @@ test('PC excludes director holds, notices and assessment label without member id
   for (const text of ['원장 센터업무', '공지', '대표원장 동작기능평가']) {
     assert.equal(ctx.isCustomerBooking({ text, isAssessment: true, memberName: '합성' }), false);
   }
+});
+for (const failure of [412, 503, 'network', 'read']) test(`actual runSync twin verification ${failure} never falls through to POST`, async () => {
+  const { ctx } = pcContext({ createMissing: true, coordinationEvent: undefined });
+  let lists = 0, patches = 0, creates = 0;
+  const g = { id: 'native-twin', etag: '1', summary: '99-001 합성회원 010-0000-0000 합성 프로그램',
+    start: { dateTime: '2026-10-15T01:00:00Z' }, end: { dateTime: '2026-10-15T02:00:00Z' } };
+  ctx.fetch = async (url, options = {}) => {
+    if (options.method === 'POST') { creates++; throw new Error('must-not-create'); }
+    if (options.method === 'PATCH') {
+      patches++; assert.equal(options.headers['If-Match'], '1');
+      if (failure === 'network') throw new Error('unknown-outcome');
+      return { ok: false, status: failure, text: async () => 'synthetic failure' };
+    }
+    lists++;
+    if (failure === 'read' && lists > 1) throw new Error('read-failed');
+    return { ok: true, json: async () => ({ items: lists === 1 ? [] : [structuredClone(g)] }) };
+  };
+  ctx.synthetic = { events: [{ id: 'booking', text: '99-001 합성회원 / 010-0000-0000 / 합성 프로그램',
+    memberNo: '99-001', memberName: '합성회원', phone: '010-0000-0000', program: '합성 프로그램',
+    start: g.start.dateTime, end: g.end.dateTime, coachId: 'coach', coachName: '합성강사',
+    totalCount: null, remainCount: null }],
+    _diagnostics: { prefetch: { attempted: true, complete: true, waitModes: ['net'], weekCounts: [1, 1, 1, 1] } } };
+  vm.runInContext(`getAuthToken = async () => 'synthetic-token';
+    findBodyCodiTab = async () => ({ id: 1 }); openFreshBodyCodiTab = async () => 2;
+    extractSchedulesFromBodyCodi = async () => synthetic; readNetLogFromBodyCodi = async () => [];
+    getSyncRange = () => ({ rangeStart: new Date('2026-10-11'), rangeEnd: new Date('2026-11-08') });`, ctx);
+  const result = await ctx.runSync();
+  assert.equal(lists, 2); assert.equal(patches, failure === 'read' ? 0 : 1); assert.equal(creates, 0);
+  assert.equal(result.summary.created, 0); assert.equal(result.summary.failed, 1);
 });

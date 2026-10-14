@@ -4,9 +4,9 @@
   // writers. Never auto-steal on timeout: a paused request may still commit.
   const SCHEMA = 'bodycodi-writer-v1';
   class WriterLock {
-    constructor(api, resource, owner, now = Date.now) {
+    constructor(api, resource, owner, now = Date.now, cloudActivationId = null) {
       if (!resource?.calendarId || !resource?.eventId || !owner) throw new Error('coordination-not-configured');
-      Object.assign(this, { api, resource, owner, now, held: false, uncertain: false, inFlight: false });
+      Object.assign(this, { api, resource, owner, now, cloudActivationId, held: false, uncertain: false, inFlight: false });
     }
     async read() {
       const event = await this.api.get(this.resource.calendarId, this.resource.eventId);
@@ -17,24 +17,31 @@
     }
     async acquire() {
       const { event, state } = await this.read();
+      if (this.cloudActivationId !== null &&
+          (state.cloudEnabled !== true || state.activationId !== this.cloudActivationId)) throw new Error('cloud-not-activated');
       if (state.owner) throw new Error('writer-busy');
       // An uncertain acquire leaves the remote owner set. No blind retry/release.
       await this.api.patch(this.resource.calendarId, this.resource.eventId,
-        { description: JSON.stringify({ schema: SCHEMA, owner: this.owner, heartbeat: this.now() }) }, event.etag);
+        { description: JSON.stringify({ ...state, owner: this.owner, heartbeat: this.now() }) }, event.etag);
       this.held = true;
     }
     async heartbeat() {
       if (!this.held || this.uncertain) throw new Error('writer-not-safe');
       const { event, state } = await this.read();
       if (state.owner !== this.owner) { this.held = false; throw new Error('writer-lost'); }
+      if (this.cloudActivationId !== null &&
+          (state.cloudEnabled !== true || state.activationId !== this.cloudActivationId)) throw new Error('cloud-not-activated');
       await this.api.patch(this.resource.calendarId, this.resource.eventId,
         { description: JSON.stringify({ ...state, heartbeat: this.now() }) }, event.etag);
     }
-    async execute(write) {
+    async execute(write, validateBeforeWrite = () => {}) {
       if (this.inFlight) throw new Error('parallel-write-rejected');
       this.inFlight = true;
       try {
         await this.heartbeat();
+        // Read/validation failures prove no member mutation was attempted.
+        // Only the mutation callback belongs in the uncertainty boundary.
+        await validateBeforeWrite();
         try { return await write(); }
         catch (e) {
           // Only an explicit 4xx rejection proves the member write did not commit.
@@ -48,7 +55,7 @@
       const { event, state } = await this.read();
       if (state.owner !== this.owner) throw new Error('writer-lost');
       await this.api.patch(this.resource.calendarId, this.resource.eventId,
-        { description: JSON.stringify({ schema: SCHEMA, owner: '', heartbeat: this.now() }) }, event.etag);
+        { description: JSON.stringify({ ...state, owner: '', heartbeat: this.now() }) }, event.etag);
       this.held = false;
       return true;
     }

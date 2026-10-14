@@ -12,6 +12,7 @@
 importScripts('reservation-enrichment.js', 'shared-writer.js');
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
 let activeWriter = null;
+let legacyWriterActive = false;
 
 // ⭐ v1.15.0: 동기화 주 수 (이번 주 포함). 바디코디 화면을 이 수만큼 주 단위로 넘기며 예약을 읽는다
 const SYNC_WEEKS = 4;
@@ -88,8 +89,8 @@ function getAuthToken(interactive = true) {
 // ---------- Google Calendar API ----------
 async function gcalFetch(token, path, options = {}) {
   if (options.method && options.method !== 'GET') {
-    if (!activeWriter) throw new Error('coordination-not-configured');
-    return activeWriter.execute(() => gcalRequest(token, path, options));
+    if (activeWriter) return activeWriter.execute(() => gcalRequest(token, path, options));
+    if (!legacyWriterActive) throw new Error('writer-not-active');
   }
   return gcalRequest(token, path, options);
 }
@@ -142,8 +143,8 @@ async function patchEvent(token, calendarId, eventId, body, etag) {
 // ⭐ v1.18.0: 일정 삭제 — 바디코디에서 취소·삭제된 예약, 같은 예약의 중복 일정만 지운다
 //   (구글 캘린더 휴지통에 30일간 남아 복구 가능). 이미 지워진 일정(404/410)은 성공으로 본다.
 async function deleteEvent(token, calendarId, eventId) {
-  if (!activeWriter) throw new Error('coordination-not-configured');
-  return activeWriter.execute(async () => {
+  if (!activeWriter && !legacyWriterActive) throw new Error('writer-not-active');
+  const write = async () => {
   const res = await fetch(
     `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
@@ -153,7 +154,8 @@ async function deleteEvent(token, calendarId, eventId) {
   const error = new Error(`GCal ${res.status}: ${text}`);
   error.status = res.status;
   throw error;
-  });
+  };
+  return activeWriter ? activeWriter.execute(write) : write();
 }
 
 // ⭐ v1.14.0: 캘린더 일정 생성
@@ -916,7 +918,9 @@ function isCustomerBooking(ev) {
 
 // 새 제목: "회원번호 성함 연락처 프로그램이름" (회원번호 없으면 생략)
 function buildTitle(ev) {
-  return ReservationEnrichment.title(ev);
+  // Scheduler rounds are not verified pass usage. Preserve the existing event
+  // round later in runSync; only use the raw round when creating a new event.
+  return ReservationEnrichment.title({ ...ev, round: null });
 }
 
 // 기존 description에서 우리가 관리하는 라인만 골라서 제거 → 사용자 콘텐츠만 남김
@@ -990,16 +994,22 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   }
   reportProgress(10, 'Google 인증 완료');
 
-  // All mutating PC runs require the same provisioned coordination resource.
-  // Dry runs remain available while rollout is blocked.
+  // Explicit migration only: an existing installation remains a legacy writer.
+  // Cloud activation is forbidden until ALL such writers are migrated/stopped.
   if (!dryRun) {
-    const { coordinationEvent } = await chrome.storage.local.get('coordinationEvent');
-    if (Object.values(coachCalendarMap).includes(coordinationEvent?.calendarId)) {
-      throw new Error('coordination-calendar-must-be-separate');
+    const { coordinationEvent, coordinationMode = 'legacy' } = await chrome.storage.local.get(['coordinationEvent', 'coordinationMode']);
+    if (coordinationMode === 'coordinated') {
+      if (Object.values(coachCalendarMap).includes(coordinationEvent?.calendarId)) {
+        throw new Error('coordination-calendar-must-be-separate');
+      }
+      activeWriter = new BodyCodiWriter.WriterLock(
+        BodyCodiWriter.calendarApi(fetch, async () => token), coordinationEvent, crypto.randomUUID());
+      await activeWriter.acquire();
+    } else if (coordinationMode === 'legacy') {
+      legacyWriterActive = true;
+    } else {
+      throw new Error('invalid-coordination-mode');
     }
-    activeWriter = new BodyCodiWriter.WriterLock(
-      BodyCodiWriter.calendarApi(fetch, async () => token), coordinationEvent, crypto.randomUUID());
-    await activeWriter.acquire();
   }
 
   // ⭐ v1.16.0: 최신 데이터 확보 — 동기화 전용 새 탭에서 읽는다 (실패 시 수동 실행만 열린 탭으로 대체)
@@ -1495,7 +1505,14 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
             await appendLog(`🔗 ${memberLabel}: 방금 생긴 같은 예약 일정("${twin.summary}")을 연결 — 새로 만들지 않음`);
             continue;
           }
-        } catch (e) { /* 재확인 실패 시 그대로 생성 (다음 동기화의 중복 정리가 처리) */ }
+        } catch (e) {
+          // A failed read or conditional twin PATCH is not evidence of absence.
+          // Never POST after a 412 (or an uncertain PATCH outcome).
+          summary.failed++;
+          summary.details.push({ ...det, 생성: false, 실패: e.message });
+          await appendLog(`⏸ 생성 보류: 기존 일정 재확인/연결 실패 — ${e.message}`);
+          continue;
+        }
         try {
           await insertEvent(token, calId, {
             summary: createTitle,
@@ -1668,7 +1685,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         const released = await activeWriter.release();
         if (!released && activeWriter.held) await appendLog('Shared writer retained: uncertain write; operator recovery required');
       }
-    } finally { activeWriter = null; isSyncing = false; }
+    } finally { activeWriter = null; legacyWriterActive = false; isSyncing = false; }
   }
 }
 

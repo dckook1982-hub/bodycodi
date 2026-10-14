@@ -12,11 +12,13 @@ function assertSnapshot(s, now, maxAgeMs) {
 // source.readSnapshot/readAppointment must use an approved live off-PC connection.
 // No filesystem/browser-profile fallback, source cache, credential provisioning,
 // scheduling, event creation/movement/deletion, or full runSync in this runner.
-async function runEnrichment({ source, calendar, coordination, owner, calendarIds, now = Date.now,
+async function runEnrichment({ source, calendar, coordination, owner, calendarIds, cloudActivationId, now = Date.now,
   maxAgeMs = 60000, dryRun = true }) {
+  if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs <= 0 || maxAgeMs > 60000) throw new Error('invalid-source-freshness-bound');
   if (!Array.isArray(calendarIds) || !calendarIds.length) throw new Error('calendar-allowlist-required');
   if (calendarIds.includes(coordination?.calendarId)) throw new Error('coordination-calendar-must-be-separate');
-  const lock = new WriterLock(calendar, coordination, owner, now);
+  if (!dryRun && (typeof cloudActivationId !== 'string' || !cloudActivationId.trim())) throw new Error('cloud-not-activated');
+  const lock = dryRun ? null : new WriterLock(calendar, coordination, owner, now, cloudActivationId);
   const report = { updated: 0, unchanged: 0, skipped: 0, conflicts: 0, countUnverified: 0, wouldUpdate: 0 };
   if (!dryRun) await lock.acquire();
   try {
@@ -49,10 +51,14 @@ async function runEnrichment({ source, calendar, coordination, owner, calendarId
         if (!body) { report.unchanged++; return; }
         assertSnapshot(fresh, now(), maxAgeMs);
         if (dryRun) { report.wouldUpdate++; return; }
-        try { await calendar.patch(a.calendarId, event.id, body, event.etag); report.updated++; }
+        try {
+          await lock.execute(() => calendar.patch(a.calendarId, event.id, body, event.etag),
+            () => assertSnapshot(fresh, now(), maxAgeMs));
+          report.updated++;
+        }
         catch (e) { if (e.status === 412) { report.conflicts++; return; } throw e; }
       };
-      if (dryRun) await apply(); else await lock.execute(apply);
+      await apply();
     }
     return report;
   } catch (error) {

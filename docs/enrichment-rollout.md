@@ -16,8 +16,10 @@ Implemented and tested with synthetic fixtures:
   adds `useNumber` to `remainNumber`, uses the member aggregate badge, derives
   a total from a program's advertised package size, or chooses a pass by name.
 - PC extraction stops guessing counts. PC/cloud use the same description renderer.
-- PC and cloud participate in a shared exclusive writer protocol, and member
-  enrichment PATCHes only `summary`/`description` with `If-Match`.
+- An explicitly opted-in PC and the cloud runner can participate in a shared
+  exclusive writer protocol; this is tested with a mock API only. Existing PC
+  installations remain in legacy mode. Cloud member enrichment PATCHes only
+  `summary`/`description` with `If-Match`.
 - Partial/stale/unauthenticated source reads fail closed. No same-name matching.
 
 **Not implemented/verified:** a live BodyCodi source adapter, authoritative
@@ -92,23 +94,31 @@ provisioned by an operator after approval. All PC instances and cloud executions
 must point to the SAME `{calendarId, eventId}`. Initial description is:
 
 ```json
-{"schema":"bodycodi-writer-v1","owner":"","heartbeat":0}
+{"schema":"bodycodi-writer-v1","owner":"","heartbeat":0,"cloudEnabled":false,"activationId":""}
 ```
 
 No provisioning operation is supplied or executed by this draft. Its ID is stored
-as the PC's `coordinationEvent` setting and passed to the cloud runner. This
+as the PC's `coordinationEvent` setting and passed to the cloud runner. PCs opt in
+with `coordinationMode: 'coordinated'`; missing settings retain legacy behavior.
+After an approved, verified migration of every writer, an operator may set
+`cloudEnabled: true` and a unique rollout `activationId`. The cloud runner requires
+the same nonempty `cloudActivationId` and checks the remote value before acquiring
+ownership and before every mutation. These settings are an activation gate, NOT
+proof that a fleet migration actually occurred; retain the fleet verification
+record separately. No settings have been changed by this work. This
 resource must be excluded from the member calendars/allowlist. Its only changing
 field is `description`; member events get only summary/description in cloud mode.
 Existing extension OAuth access is sufficient in principle if the user already
 has write access to that calendar; no new grant is assumed or requested here.
 
-Acquisition and heartbeats use ETag compare-and-swap. Each run uses a unique
+In the tested adapter, acquisition and heartbeats use ETag compare-and-swap. Each run uses a unique
 owner ID. A second contender gets busy or HTTP 412. Every mutation is preceded
 by an ownership check/heartbeat, and there is at most one in-flight mutation per
 owner. The lock **does not expire or auto-steal**: PC disconnection and an old
 heartbeat cannot prove an HTTP request will never commit. A network error/5xx
 during member mutation retains ownership and blocks subsequent writers. A
-definitive 4xx rejection permits release. Unknown acquisition/release outcomes
+definitive 4xx rejection permits release. Read or pre-write validation failures
+also permit release because no member mutation was attempted. Unknown acquisition/release outcomes
 are never blindly retried. The next run must read current lock/event state.
 
 Recovery is intentionally manual and requires proving the old writer is stopped
@@ -123,7 +133,10 @@ sync, old extension builds, and other automations do not participate. Before
 activation, inventory them and verify their behavior; they can invalidate this
 design if they overwrite the enriched fields. Do not silently disable an integration
 or alter permissions. Upgrade/disable every old extension writer only with rollout
-approval. `runSync` in this draft refuses mutations if no lock is configured.
+approval. An explicitly coordinated `runSync` refuses mutations if its lock is
+missing; it never falls back to legacy. Existing installations default to legacy
+and remain usable, so cloud MUST remain disabled until every writer is accounted
+for. Missing/default legacy settings cannot establish cloud eligibility.
 
 The cloud runner rereads the exact source appointment, then the target event,
 matches identity/calendar/time again, and conditionally patches the current ETag.
@@ -171,9 +184,10 @@ support, nonoverlap, or session renewal.
    Calendar writes through an approved connection. If new persistent credentials,
    OAuth grants, paid infrastructure, or security changes are required, obtain
    action-time approval first.
-3. Obtain approval for the exact coordination resource creation and fleet rollout.
+3. Obtain approval for the exact coordination resource creation and opt-in fleet rollout.
    Inventory all writers, provision one shared resource, configure each client,
-   and verify an old/offline PC cannot resume an uncoordinated build. This draft
+   and verify an old/offline PC cannot resume an uncoordinated build. Then explicitly
+   activate cloud on the shared resource with the reviewed rollout ID. This draft
    has not installed an extension, changed storage settings, or altered calendars.
 4. Run synthetic end-to-end integration tests in the intended cloud runtime and
    an approved read-only dry run against the real source. Compare proposed changes
@@ -200,3 +214,10 @@ and a mocked actual PC `runSync` that preserves a cloud-corrected 39/13.
 `npm run check` syntax-checks extension and new modules. No CI configuration
 exists on baseline main; no live-browser extension installation or live calendar
 test was performed. No production unattended execution is claimed.
+
+Follow-up review fixed the pre-write failure lock leak, existing assessment round
+regression, twin PATCH conflict -> POST fallback, legacy PC migration regression,
+ambiguous program-note replacement, wrong event-ID response, and unbounded
+freshness configuration. Tests now also cover committed-write response loss,
+partial-run retry, explicit cloud activation, and read-only planning without
+provisioning. See `source-runtime-path.md` for the next operational evidence.

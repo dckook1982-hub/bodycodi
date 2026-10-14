@@ -19,7 +19,7 @@ const event = () => ({ id: 'test-event', etag: '1', status: 'confirmed', summary
   extendedProperties: { private: { bcSyncId: 'synthetic-booking', other: 'keep' } },
   attendees: [{ email: 'synthetic@example.invalid' }], colorId: '3', location: 'keep' });
 function setup(s = snapshot()) {
-  const data = new Map([['coord/lock', { id: 'lock', etag: '1', description: JSON.stringify({ schema: 'bodycodi-writer-v1', owner: '' }) }],
+  const data = new Map([['coord/lock', { id: 'lock', etag: '1', description: JSON.stringify({ schema: 'bodycodi-writer-v1', owner: '', cloudEnabled: true, activationId: 'synthetic-rollout' }) }],
     ['test-calendar/test-event', event()]]);
   const writes = [];
   const api = {
@@ -34,7 +34,7 @@ function setup(s = snapshot()) {
   };
   const options = { source: { readSnapshot: async () => copy(s), readAppointment: async () => copy(s) },
     calendar: api, coordination: { calendarId: 'coord', eventId: 'lock' }, owner: 'cloud-unique',
-    calendarIds: ['test-calendar'], now: () => NOW, dryRun: false };
+    calendarIds: ['test-calendar'], cloudActivationId: 'synthetic-rollout', now: () => NOW, dryRun: false };
   return { data, writes, api, options, memberWrites: () => writes.filter(w => w.id === 'test-event') };
 }
 
@@ -167,8 +167,9 @@ test('source aging during calendar reread prevents write', async () => {
   const h = setup(), get = h.api.get; let now = NOW;
   h.options.now = () => now;
   h.api.get = async (cal, id) => { const e = await get(cal, id); if (id === 'test-event') now += 60001; return e; };
-  await assert.rejects(runEnrichment(h.options), /source-not-fresh-complete/);
+  await assert.rejects(runEnrichment(h.options), e => /source-not-fresh-complete/.test(e.message) && e.report.lockReleased === true);
   assert.equal(h.memberWrites().length, 0);
+  assert.equal(JSON.parse(h.data.get('coord/lock').description).owner, '');
 });
 test('lock owner changes before write: no callback and no release of another owner', async () => {
   const h = setup(), pc = new WriterLock(h.api, h.options.coordination, 'pc'); await pc.acquire();
@@ -195,4 +196,92 @@ test('failed run reports confirmed progress without member content', async () =>
     assert.equal(error.report.updated, 0); assert.equal(error.report.lockReleased, true);
     assert.ok(!JSON.stringify(error.report).includes('합성회원')); return true;
   });
+});
+test('differing legacy program line may be a manual note and is preserved', () => {
+  const old = '프로그램명 : 과거 프로그램 (원장 확인 필요)\n메모';
+  assert.equal(E.description({ program: '새 프로그램' }, old), old);
+});
+test('leading blank line and CRLF notes survive rendering', () => {
+  const old = '\r\n프로그램명 : 합성 프로그램\r\n총횟수 : 52회\r\n수동 메모\r\n';
+  assert.equal(E.description({ program: '합성 프로그램', totalCount: 39 }, old),
+    '\r\n프로그램명 : 합성 프로그램\r\n총횟수 : 39회\r\n수동 메모\r\n');
+});
+test('wrong event ID is rejected even when its reservation marker matches', async () => {
+  const h = setup(); h.data.get('test-calendar/test-event').id = 'different-event';
+  assert.equal((await runEnrichment(h.options)).conflicts, 1);
+  assert.equal(h.memberWrites().length, 0);
+});
+test('invalid, zero and negative duration never match', () => {
+  for (const end of ['invalid', appointment().start, '2026-10-14T01:00:00Z']) {
+    const a = { ...appointment(), end }, g = event(); g.end.dateTime = end;
+    assert.equal(E.matches(a, g), false);
+  }
+  assert.equal(E.matches(appointment(), null), false);
+});
+test('NaN/infinite/disabled freshness cannot enable stale data writes', async () => {
+  for (const maxAgeMs of [NaN, Infinity, 0, -1, 60001]) {
+    const h = setup(); h.options.maxAgeMs = maxAgeMs;
+    await assert.rejects(runEnrichment(h.options), /invalid-source-freshness-bound/);
+    assert.equal(h.writes.length, 0);
+  }
+});
+test('later source failure retains confirmed progress and retry does not repeat first write', async () => {
+  const first = appointment(); const second = { ...appointment(), id: 'booking-two', googleEventId: 'event-two' };
+  const s = snapshot(); s.appointments = [first, second]; const h = setup(s);
+  const secondEvent = event(); secondEvent.id = 'event-two'; secondEvent.extendedProperties.private.bcSyncId = 'booking-two';
+  h.data.set('test-calendar/event-two', secondEvent);
+  let failSecond = true;
+  h.options.source.readAppointment = async id => {
+    if (id === second.id && failSecond) throw new Error('source-lost-mid-run');
+    return snapshot(id === second.id ? second : first);
+  };
+  await assert.rejects(runEnrichment(h.options), error => error.report.updated === 1 && error.report.lockReleased === true);
+  assert.equal(h.memberWrites().length, 1);
+  failSecond = false;
+  const retry = await runEnrichment(h.options); assert.equal(retry.unchanged, 1); assert.equal(retry.updated, 1);
+  assert.equal(h.memberWrites().length, 1);
+});
+test('network error after committed member patch retains lock and prevents unsafe retry', async () => {
+  const h = setup(), patch = h.api.patch;
+  h.api.patch = async (...args) => {
+    const result = await patch(...args);
+    if (args[1] === 'test-event') throw new Error('response-lost-after-commit');
+    return result;
+  };
+  await assert.rejects(runEnrichment(h.options), error => error.report.lockReleased === false);
+  assert.equal(h.memberWrites().length, 1);
+  await assert.rejects(runEnrichment(h.options), /writer-busy/);
+  assert.equal(h.memberWrites().length, 1);
+});
+test('cloud cannot write before explicit remote rollout activation', async () => {
+  for (const state of [{}, { cloudEnabled: false }, { cloudEnabled: true, activationId: 'wrong-rollout' }]) {
+    const h = setup(); h.data.get('coord/lock').description = JSON.stringify({ schema: 'bodycodi-writer-v1', owner: '', ...state });
+    await assert.rejects(runEnrichment(h.options), /cloud-not-activated/); assert.equal(h.writes.length, 0);
+  }
+  const h = setup(); delete h.options.cloudActivationId;
+  await assert.rejects(runEnrichment(h.options), /cloud-not-activated/); assert.equal(h.writes.length, 0);
+});
+test('read-only cloud planning does not require provisioning or activation', async () => {
+  const h = setup(); h.options.dryRun = true;
+  delete h.options.cloudActivationId; delete h.options.coordination; delete h.options.owner;
+  assert.equal((await runEnrichment(h.options)).wouldUpdate, 1); assert.equal(h.writes.length, 0);
+});
+test('Calendar GET failure releases lock because no member mutation started', async () => {
+  const h = setup(), get = h.api.get;
+  h.api.get = async (cal, id) => { if (id === 'test-event') throw new Error('get-network-error'); return get(cal, id); };
+  await assert.rejects(runEnrichment(h.options), e => e.report.lockReleased === true);
+  assert.equal(h.memberWrites().length, 0);
+  h.api.get = get;
+  assert.equal((await runEnrichment(h.options)).updated, 1);
+});
+test('freshness expires during heartbeat: release without attempting mutation', async () => {
+  const h = setup(), patch = h.api.patch; let now = NOW; let lockWrites = 0;
+  h.options.now = () => now;
+  h.api.patch = async (...args) => {
+    const result = await patch(...args);
+    if (args[1] === 'lock' && ++lockWrites === 2) now += 60001;
+    return result;
+  };
+  await assert.rejects(runEnrichment(h.options), e => e.report.lockReleased === true);
+  assert.equal(h.memberWrites().length, 0);
 });

@@ -54,7 +54,9 @@
   // Replace only canonical machine lines for fields we actually know. Unknown
   // counts preserve existing values; annotated/manual lines and whitespace survive.
   function description(a, existing = '') {
-    const lines = String(existing).split('\n');
+    const text = String(existing);
+    const separator = text.includes('\r\n') ? '\r\n' : '\n';
+    const lines = text === '' ? [] : text.split(separator);
     const specs = [
       [a.program, /^프로그램명\s*:\s*.+$/, v => `프로그램명 : ${v}`],
       [a.validPeriod, /^유효기간\s*:\s*[\d\-./]+(?:\s*~\s*[\d\-./]+)?\s*$/, v => `유효기간 : ${v}`],
@@ -66,10 +68,13 @@
       const indices = lines.flatMap((line, i) => re.test(line.trim()) ? [i] : []);
       // Multiple candidate lines can include manual notes: do not guess ownership.
       if (indices.length > 1) continue;
+      // Legacy program lines have no ownership boundary; any differing text may
+      // contain a manual annotation. Preserve it rather than deleting that note.
+      if (re === specs[0][1] && indices.length === 1 && lines[indices[0]].trim() !== render(value)) continue;
       if (indices.length === 1) lines[indices[0]] = render(value);
       else lines.push(render(value));
     }
-    return lines.join('\n').replace(/^\n(?=프로그램명|유효기간|총횟수|잔여횟수)/, '');
+    return lines.join(separator);
   }
 
   function member(a) {
@@ -78,12 +83,14 @@
       nonempty(a.phone) && nonempty(a.program) && a.status === 'active';
   }
   function matches(a, g) {
+    if (!g || !nonempty(g.id) || (a.googleEventId && a.googleEventId !== g.id)) return false;
     const marker = g?.extendedProperties?.private?.bcSyncId;
     // No same-name, same-slot or program-title guesses. Unmarked events need a
     // source-proven Google event ID (adapter must verify the source link).
     const identity = marker === a.id || (!marker && a.googleEventId && a.googleEventId === g?.id);
     const time = v => typeof v === 'string' ? Date.parse(v) : NaN;
     return identity && g.status !== 'cancelled' && !g.recurringEventId &&
+      Number.isFinite(time(a.start)) && time(a.end) > time(a.start) &&
       time(a.start) === time(g.start?.dateTime) && time(a.end) === time(g.end?.dateTime);
   }
   function patch(a, g) {
