@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "mcp__Google_Drive",
+      "mcp__Google_Calendar",
+      "mcp__github",
+      "mcp__Claude_Code_Remote"
+    ]
+  }
+}
