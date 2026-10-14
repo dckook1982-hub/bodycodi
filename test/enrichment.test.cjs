@@ -300,3 +300,65 @@ test('release uncertainty still reports confirmed member progress', async () => 
   await assert.rejects(runEnrichment(h.options), error => error.report.updated === 1 && error.report.lockReleased === false);
   assert.equal(JSON.parse(h.data.get('coord/lock').description).owner, 'cloud-unique');
 });
+function slowUiSetup() {
+  const rows = [1, 2, 3].map(n => ({ ...appointment(), id: `booking-${n}`, googleEventId: `event-${n}` }));
+  const h = setup(); let clock = NOW, snapshots = 0; const reads = [];
+  for (const a of rows) {
+    const g = event(); g.id = a.googleEventId; g.extendedProperties.private.bcSyncId = a.id;
+    h.data.set(`test-calendar/${g.id}`, g);
+  }
+  h.options.now = () => clock;
+  h.options.source.readSnapshot = async () => {
+    snapshots++; return { ...snapshot(), readAt: clock, appointments: copy(rows) };
+  };
+  h.options.source.readAppointment = async id => {
+    clock += 31000; reads.push(id);
+    return { ...snapshot(copy(rows.find(a => a.id === id))), readAt: clock };
+  };
+  return { ...h, rows, reads, clock: () => clock, snapshots: () => snapshots };
+}
+test('slow 31-second UI reads reach third appointment; retries do not starve the tail', async () => {
+  const h = slowUiSetup();
+  assert.equal((await runEnrichment(h.options)).updated, 3);
+  assert.equal(h.snapshots(), 2);
+  assert.deepEqual(h.reads, ['booking-1', 'booking-2', 'booking-3']);
+  const again = await runEnrichment(h.options);
+  assert.equal(again.unchanged, 3); assert.equal(again.updated, 0);
+  assert.deepEqual(h.reads.slice(3), ['booking-1', 'booking-2', 'booking-3']);
+});
+test('candidate refresh uses changed tail and excludes newly cancelled reservation', async () => {
+  for (const status of ['active', 'cancelled']) {
+    const h = slowUiSetup(), read = h.options.source.readSnapshot;
+    h.options.source.readSnapshot = async () => {
+      if (h.snapshots() === 1) { h.rows[2].memberName = '변경합성회원'; h.rows[2].status = status; }
+      return read();
+    };
+    const result = await runEnrichment(h.options);
+    const third = h.data.get('test-calendar/event-3');
+    if (status === 'active') { assert.equal(result.updated, 3); assert.match(third.summary, /변경합성회원/); }
+    else { assert.equal(result.updated, 2); assert.equal(third.summary, 'old'); assert.equal(result.skipped, 1); }
+  }
+});
+test('next run rechecks earlier changed/cancelled records; no persistent cursor skips them', async () => {
+  const h = slowUiSetup(); await runEnrichment(h.options);
+  h.rows[0].memberName = '새합성회원'; h.rows[1].status = 'cancelled';
+  const secondBefore = copy(h.data.get('test-calendar/event-2'));
+  const result = await runEnrichment(h.options);
+  assert.equal(result.updated, 1); assert.equal(result.skipped, 1);
+  assert.match(h.data.get('test-calendar/event-1').summary, /새합성회원/);
+  assert.deepEqual(h.data.get('test-calendar/event-2'), secondBefore);
+});
+test('refresh never excuses stale detail or partial candidate data', async () => {
+  for (const failure of ['detail', 'candidates']) {
+    const h = slowUiSetup();
+    if (failure === 'detail') {
+      const read = h.options.source.readAppointment;
+      h.options.source.readAppointment = async id => { const s = await read(id); if (id === 'booking-3') s.readAt -= 60001; return s; };
+    } else {
+      const read = h.options.source.readSnapshot;
+      h.options.source.readSnapshot = async () => { const s = await read(); if (h.snapshots() > 1) s.complete = false; return s; };
+    }
+    await assert.rejects(runEnrichment(h.options), e => /source-not-fresh-complete/.test(e.message) && e.report.updated === 2 && e.report.lockReleased === true);
+    assert.equal(h.data.get('test-calendar/event-3').summary, 'old');
+  }
+});

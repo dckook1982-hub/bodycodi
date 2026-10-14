@@ -22,23 +22,43 @@ async function runEnrichment({ source, calendar, coordination, owner, calendarId
   const report = { updated: 0, unchanged: 0, skipped: 0, conflicts: 0, countUnverified: 0, wouldUpdate: 0 };
   if (!dryRun) await lock.acquire();
   try {
-    const snapshot = await source.readSnapshot();
+    let snapshot = await source.readSnapshot();
     assertSnapshot(snapshot, now(), maxAgeMs);
-    const targets = new Set();
-    for (const original of snapshot.appointments) {
-      if (!enrichment.member(original) || !calendarIds.includes(original.calendarId) || !original.googleEventId) { report.skipped++; continue; }
-      const key = JSON.stringify([original.calendarId, original.googleEventId]);
-      if (targets.has(key)) throw new Error('duplicate-event-link');
-      targets.add(key);
-    }
-    for (const original of snapshot.appointments) {
-      if (!enrichment.member(original) || !calendarIds.includes(original.calendarId) || !original.googleEventId) continue;
+    const mappingRevision = snapshot.mappingRevision;
+    const processed = new Set(), excluded = new Set();
+    const candidatesFrom = s => {
+      const targets = new Set(), candidates = [];
+      for (const a of s.appointments) {
+        if (!enrichment.member(a) || !calendarIds.includes(a.calendarId) || !a.googleEventId) {
+          if (!excluded.has(a.id)) { excluded.add(a.id); report.skipped++; }
+          continue;
+        }
+        const key = JSON.stringify([a.calendarId, a.googleEventId]);
+        if (targets.has(key)) throw new Error('duplicate-event-link');
+        targets.add(key); candidates.push(a);
+      }
+      return candidates;
+    };
+    let candidates = candidatesFrom(snapshot);
+    while (candidates.some(a => !processed.has(a.id))) {
+      // UI detail reads may take tens of seconds. Refresh the candidate list
+      // without restarting its prefix; never persist a cursor across runs.
+      if (now() - snapshot.readAt > maxAgeMs) {
+        snapshot = await source.readSnapshot();
+        assertSnapshot(snapshot, now(), maxAgeMs);
+        if (snapshot.mappingRevision !== mappingRevision) throw new Error('source-mapping-changed');
+        candidates = candidatesFrom(snapshot);
+      }
       assertSnapshot(snapshot, now(), maxAgeMs);
+      const original = candidates.find(a => !processed.has(a.id));
+      if (!original) break;
+      processed.add(original.id);
       // A fresh exact appointment read, including its linked pass, before EVERY write.
       const fresh = await source.readAppointment(original.id);
       assertSnapshot(fresh, now(), maxAgeMs);
       if (fresh.mappingRevision !== snapshot.mappingRevision || fresh.appointments.length !== 1) throw new Error('source-mapping-changed');
       const a = fresh.appointments[0];
+      if (!enrichment.member(a)) { report.skipped++; continue; }
       if (a.id !== original.id || a.memberId !== original.memberId || a.calendarId !== original.calendarId ||
           a.googleEventId !== original.googleEventId || a.start !== original.start || a.end !== original.end) { report.conflicts++; continue; }
       const resolved = enrichment.resolve(a, fresh.passes);

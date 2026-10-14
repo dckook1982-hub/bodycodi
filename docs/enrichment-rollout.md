@@ -51,6 +51,18 @@ includes pagination, all requested dates/coaches, and completed UI loading.
 freshness is 60 seconds, checked again before each write. A login page, missing
 field, timeout, or partially loaded page must not be marked complete.
 
+When slow detail reads age the candidate list beyond this bound, the runner reads
+a new complete candidate snapshot with the same mapping revision. It retains an
+in-memory set of already attempted reservation IDs for that run, so refreshing
+does not restart the prefix. Candidate removals/cancellations and changed pending
+records are taken from the refreshed list. Every write still requires a fresh
+exact detail read and fresh Calendar ETag. No cursor is persisted across runs:
+the next run rechecks earlier records too, including subsequent changes/cancellations.
+Items already attempted in a run are reconsidered on the next run, not silently
+excluded forever. A partial refresh or stale detail stops writes rather than
+relaxing freshness. Synthetic 31-second-per-detail tests cover progress to the
+third item, repeat-run idempotency and changed/cancelled/stale source cases.
+
 Each appointment needs exact stable `id`, `memberId`, `linkedPassId`,
 `calendarId`, `googleEventId`, `start`, `end`, `memberName`, `phone`, `program`,
 and `kind: 'member-reservation'`, `memberVerified: true`, `status: 'active'`.
