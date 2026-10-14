@@ -285,3 +285,18 @@ test('freshness expires during heartbeat: release without attempting mutation', 
   await assert.rejects(runEnrichment(h.options), e => e.report.lockReleased === true);
   assert.equal(h.memberWrites().length, 0);
 });
+test('credential-provider rejection before fetch does not poison member writer', async () => {
+  const h = setup(), lock = new WriterLock(h.api, h.options.coordination, 'pc'); await lock.acquire();
+  const api = calendarApi(async () => assert.fail('fetch must not start'), async () => { throw new Error('auth-expired'); });
+  await assert.rejects(lock.execute(() => api.patch('cal', 'event', { summary: 'x' }, 'etag')), /auth-expired/);
+  assert.equal(lock.uncertain, false); assert.equal(await lock.release(), true);
+});
+test('release uncertainty still reports confirmed member progress', async () => {
+  const h = setup(), patch = h.api.patch;
+  h.api.patch = async (...args) => {
+    if (args[1] === 'lock' && JSON.parse(args[2].description).owner === '') throw new Error('release-network-error');
+    return patch(...args);
+  };
+  await assert.rejects(runEnrichment(h.options), error => error.report.updated === 1 && error.report.lockReleased === false);
+  assert.equal(JSON.parse(h.data.get('coord/lock').description).owner, 'cloud-unique');
+});

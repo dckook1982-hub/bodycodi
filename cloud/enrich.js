@@ -65,6 +65,15 @@ async function runEnrichment({ source, calendar, coordination, owner, calendarId
     // Counts only: no names, phone numbers, source payloads, or event text in reports.
     error.report = report;
     throw error;
-  } finally { if (!dryRun) report.lockReleased = await lock.release(); }
+  } finally {
+    if (!dryRun) {
+      try { report.lockReleased = await lock.release(); }
+      catch (error) {
+        report.lockReleased = false;
+        error.report = report;
+        throw error;
+      }
+    }
+  }
 }
 module.exports = { runEnrichment, assertSnapshot };

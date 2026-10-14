@@ -45,7 +45,7 @@
         try { return await write(); }
         catch (e) {
           // Only an explicit 4xx rejection proves the member write did not commit.
-          if (!(e.status >= 400 && e.status < 500)) this.uncertain = true;
+          if (e.mutationStarted !== false && !(e.status >= 400 && e.status < 500)) this.uncertain = true;
           throw e;
         }
       } finally { this.inFlight = false; }
@@ -63,7 +63,9 @@
 
   function calendarApi(fetchImpl, getToken) {
     async function request(cal, id, options = {}) {
-      const token = await getToken();
+      let token;
+      try { token = await getToken(); }
+      catch (error) { error.mutationStarted = false; throw error; }
       const response = await fetchImpl(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal)}/events/${encodeURIComponent(id)}`, {
         ...options, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...(options.headers || {}) }
       });
