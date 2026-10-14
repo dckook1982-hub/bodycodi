@@ -1,10 +1,11 @@
-# Runtime decision — pending live UI contract and connection verification
+# Runtime decision — pending live bindings and connection verification
 
 **Decision:** retain concurrent manual Calendar editing and conditional writes.
 Prefer the existing dot cloud connections if they can expose real ETag-conditional
 updates. Otherwise evaluate a private, owner-authenticated Apps Script bridge.
-Neither route is operational. Do not wire a source adapter until the parent
-delivers the observed booking-detail -> selected-pass UI contract.
+Neither route is operational. The parent delivered the observed booking-detail
+to selected-pass UI contract, now covered by `bodycodi-ui-source.js` and synthetic
+tests. Binding it to the supported live cloud browser remains a separate step.
 
 | | Existing connections (preferred) | Private Apps Script bridge (fallback) |
 | --- | --- | --- |

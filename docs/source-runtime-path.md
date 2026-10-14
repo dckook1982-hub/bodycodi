@@ -1,7 +1,10 @@
 # Remaining path from tested code to off-PC operation
 
 This is an evidence/authorization plan, not a deployed service. No live source
-adapter or operational shared lock exists. All code tests use synthetic records.
+binding or operational shared lock exists. All code tests use synthetic records.
+The parent supplied the sanitized rendered UI contract; its parser and semantic
+navigation implementation are in `bodycodi-ui-source.js`. See the
+[observed path and remaining binding work](rendered-source-contract.md).
 
 ## What the existing repository can and cannot establish
 
@@ -18,15 +21,16 @@ install it, dump scheduler state, or inspect cookies/tokens to bridge this gap.
 
 README and CLAUDE.md document no public BodyCodi API, export schema, or supported
 booking-to-pass lookup endpoint. They cannot establish the relation on their own.
-The parent's cloud browser has observed reservation IDs and pass IDs in the UI.
-That proves the identifiers exist, but not yet that a particular pass is the one
-charged by a particular booking. No real identifiers need to be committed here.
+The parent's cloud browser verified the selected `productList` option on a
+particular reservation, the member navigation and matching pass detail. That
+establishes the rendered booking-to-pass relation; it does not establish an
+undocumented scheduler field. No real identifiers are committed here.
 
-## Exact read-only UI evidence needed next
+## Evidence to preserve in the live binding
 
-The parent can continue in its already authenticated cloud browser. For one
-synthetic-equivalent case and the two-pass case, capture a private observation
-record with these fields and the UI locator/label that produced each value:
+The already authenticated cloud browser can perform read-only binding validation.
+For the single-pass and two-pass cases, privately verify the following fields and
+their rendered locations, including coverage beyond the supplied pass path:
 
 | Evidence | Acceptance condition | On failure |
 | --- | --- | --- |
@@ -47,15 +51,12 @@ before writing; if its member/pass/time changes, replan or skip. Member-wide
 17/11 is never substituted for the selected pass's 10/6. IDs in separate unrelated
 screens without a visible linking action are insufficient.
 
-The missing engineering handoff is a **sanitized locator-and-label map**, e.g.
-the actual reservation dialog heading, selected-pass link/row semantics and the
-labels for the three counts; replace all member values with synthetic ones.
-Do not invent selectors from field names. Once this map is supplied, implement
-the DOM/UI driver against those observed surfaces, normalize into the documented
-contract, and exercise it against saved synthetic UI fixtures. This can be done
-without extracting credentials or calling an undocumented background endpoint.
-If the UI has no booked-pass link, ask BodyCodi for a supported read-only export
-or documented interface; do not invent the relation.
+The sanitized selected-pass locator-and-label map is now implemented and tested.
+Do not invent missing selectors for candidate enumeration, visible contact data,
+classification, event mapping or loading-complete detection. Bind the semantic
+driver only through supported browser tools; test it read-only without extracting
+credentials or calling an undocumented background endpoint. The edit form's
+end-time controls are unreliable and must never replace grid/detail times.
 
 ## Runtime options, including a real single-writer alternative
 
@@ -130,6 +131,6 @@ implementation. No external action below has been requested/executed yet.
    correction as the canary, and do not run live full sync.
 
 If authorization is not needed because an existing approved conditional-write
-connection is found, skip the bridge entirely. The next step is the private UI
-evidence handoff and connector capability confirmation, not purchasing a server
+connection is found, skip the bridge entirely. The next step is supported live
+UI binding and connector capability confirmation, not purchasing a server
 or asking the user for credentials.

@@ -21,9 +21,13 @@ Implemented and tested with synthetic fixtures:
   installations remain in legacy mode. Cloud member enrichment PATCHes only
   `summary`/`description` with `If-Match`.
 - Partial/stale/unauthenticated source reads fail closed. No same-name matching.
+- The parent's verified rendered-UI path is implemented as a tested parsing and
+  navigation contract in `bodycodi-ui-source.js`; see [its exact selectors,
+  semantics and driver obligations](rendered-source-contract.md). It selects the
+  booking's pass ID and checks explicit total/used/remaining on that pass.
 
-**Not implemented/verified:** a live BodyCodi source adapter, authoritative
-appointment-to-pass field mapping, a live off-PC Calendar adapter using an
+**Not implemented/verified:** a bound live BodyCodi browser driver and complete
+candidate enumeration, a live off-PC Calendar adapter using an
 approved connection, provisioned coordination event, fleet rollout, scheduled
 execution, cloud deployment, or an end-to-end live run. The supplied PC scheduler
 does not expose a verified linked-pass ID. Its raw numeric field names do not
@@ -47,7 +51,8 @@ Both return:
 These are OUR normalized names, not claimed BodyCodi API fields. The exact read
 must return exactly one appointment and its relevant pass details. Completeness
 includes pagination, all requested dates/coaches, and completed UI loading.
-`readAt` means completion of a fresh source read, never cache-read time. Default
+`readAt` is the oldest observation used in a fresh source read, never cache-read
+time or a later completion time that disguises older observations. Default
 freshness is 60 seconds, checked again before each write. A login page, missing
 field, timeout, or partially loaded page must not be marked complete.
 
@@ -83,7 +88,8 @@ An assessment round can be explicit or `used + 1` only when the source verifies
 `usagePosition: 'next-unconsumed'`; a scheduled visit is not automatically the
 next unconsumed visit.
 
-Before writing the adapter, verify in the authenticated cloud UI, read-only:
+The parent has verified the selected-pass UI path and explicit count labels.
+Before enabling the live adapter, verify its read-only behavior for:
 
 1. One appointment -> exactly the pass it booked. Record stable field/visible
    identity locations and meaning without retaining member data in GitHub.
@@ -95,9 +101,9 @@ Before writing the adapter, verify in the authenticated cloud UI, read-only:
 4. Zero/unlimited, assessment charge timing, inactive/cancelled states, and
    nonmember holds. Verify completeness and session-expiry behavior.
 
-The PC raw scheduler extraction deliberately returns null counts until this
+The PC raw scheduler extraction deliberately returns null counts until a live
 adapter is available. This is a safe guardrail, not completed automatic count
-correction. A future PC source adapter must call the same `resolve()` function.
+correction. A future PC source binding must call the same `resolve()` function.
 
 ## Coordination and conflicts
 
