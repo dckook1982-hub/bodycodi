@@ -1,0 +1,64 @@
+'use strict';
+const enrichment = require('../reservation-enrichment');
+const { WriterLock } = require('../shared-writer');
+
+function assertSnapshot(s, now, maxAgeMs) {
+  if (s?.schema !== 'bodycodi-linked-pass-v1' || !s.mappingRevision || s.authenticated !== true ||
+      s.complete !== true || !Array.isArray(s.appointments) || !Array.isArray(s.passes) ||
+      !Number.isFinite(s.readAt) || s.readAt > now || now - s.readAt > maxAgeMs) throw new Error('source-not-fresh-complete');
+  if (new Set(s.appointments.map(a => a.id)).size !== s.appointments.length) throw new Error('duplicate-source-id');
+}
+
+// source.readSnapshot/readAppointment must use an approved live off-PC connection.
+// No filesystem/browser-profile fallback, source cache, credential provisioning,
+// scheduling, event creation/movement/deletion, or full runSync in this runner.
+async function runEnrichment({ source, calendar, coordination, owner, calendarIds, now = Date.now,
+  maxAgeMs = 60000, dryRun = true }) {
+  if (!Array.isArray(calendarIds) || !calendarIds.length) throw new Error('calendar-allowlist-required');
+  if (calendarIds.includes(coordination?.calendarId)) throw new Error('coordination-calendar-must-be-separate');
+  const lock = new WriterLock(calendar, coordination, owner, now);
+  const report = { updated: 0, unchanged: 0, skipped: 0, conflicts: 0, countUnverified: 0, wouldUpdate: 0 };
+  if (!dryRun) await lock.acquire();
+  try {
+    const snapshot = await source.readSnapshot();
+    assertSnapshot(snapshot, now(), maxAgeMs);
+    const targets = new Set();
+    for (const original of snapshot.appointments) {
+      if (!enrichment.member(original) || !calendarIds.includes(original.calendarId) || !original.googleEventId) { report.skipped++; continue; }
+      const key = JSON.stringify([original.calendarId, original.googleEventId]);
+      if (targets.has(key)) throw new Error('duplicate-event-link');
+      targets.add(key);
+    }
+    for (const original of snapshot.appointments) {
+      if (!enrichment.member(original) || !calendarIds.includes(original.calendarId) || !original.googleEventId) continue;
+      assertSnapshot(snapshot, now(), maxAgeMs);
+      // A fresh exact appointment read, including its linked pass, before EVERY write.
+      const fresh = await source.readAppointment(original.id);
+      assertSnapshot(fresh, now(), maxAgeMs);
+      if (fresh.mappingRevision !== snapshot.mappingRevision || fresh.appointments.length !== 1) throw new Error('source-mapping-changed');
+      const a = fresh.appointments[0];
+      if (a.id !== original.id || a.memberId !== original.memberId || a.calendarId !== original.calendarId ||
+          a.googleEventId !== original.googleEventId || a.start !== original.start || a.end !== original.end) { report.conflicts++; continue; }
+      const resolved = enrichment.resolve(a, fresh.passes);
+      if (resolved.countStatus !== 'verified') report.countUnverified++;
+      const apply = async () => {
+        assertSnapshot(fresh, now(), maxAgeMs);
+        const event = await calendar.get(a.calendarId, a.googleEventId);
+        if (!event.etag || !enrichment.matches(a, event)) { report.conflicts++; return; }
+        const body = enrichment.patch(resolved, event);
+        if (!body) { report.unchanged++; return; }
+        assertSnapshot(fresh, now(), maxAgeMs);
+        if (dryRun) { report.wouldUpdate++; return; }
+        try { await calendar.patch(a.calendarId, event.id, body, event.etag); report.updated++; }
+        catch (e) { if (e.status === 412) { report.conflicts++; return; } throw e; }
+      };
+      if (dryRun) await apply(); else await lock.execute(apply);
+    }
+    return report;
+  } catch (error) {
+    // Counts only: no names, phone numbers, source payloads, or event text in reports.
+    error.report = report;
+    throw error;
+  } finally { if (!dryRun) report.lockReleased = await lock.release(); }
+}
+module.exports = { runEnrichment, assertSnapshot };

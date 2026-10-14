@@ -9,7 +9,9 @@
 // - popup.js의 __bcPopup 메시지 구조에 맞춤
 // ================================================
 
+importScripts('reservation-enrichment.js', 'shared-writer.js');
 const CALENDAR_API = 'https://www.googleapis.com/calendar/v3';
+let activeWriter = null;
 
 // ⭐ v1.15.0: 동기화 주 수 (이번 주 포함). 바디코디 화면을 이 수만큼 주 단위로 넘기며 예약을 읽는다
 const SYNC_WEEKS = 4;
@@ -85,6 +87,14 @@ function getAuthToken(interactive = true) {
 
 // ---------- Google Calendar API ----------
 async function gcalFetch(token, path, options = {}) {
+  if (options.method && options.method !== 'GET') {
+    if (!activeWriter) throw new Error('coordination-not-configured');
+    return activeWriter.execute(() => gcalRequest(token, path, options));
+  }
+  return gcalRequest(token, path, options);
+}
+
+async function gcalRequest(token, path, options = {}) {
   const res = await fetch(`${CALENDAR_API}${path}`, {
     ...options,
     headers: {
@@ -95,7 +105,9 @@ async function gcalFetch(token, path, options = {}) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`GCal ${res.status}: ${text}`);
+    const error = new Error(`GCal ${res.status}: ${text}`);
+    error.status = res.status;
+    throw error;
   }
   return res.json();
 }
@@ -108,33 +120,40 @@ async function listEventsInRange(token, calendarId, timeMin, timeMax) {
     orderBy: 'startTime',
     maxResults: '2500',
     // extendedProperties는 fields 미지정 시 기본 응답에 포함됨 — 명시적으로 보장
-    fields: 'items(id,summary,description,start,end,extendedProperties,colorId,transparency,created)'
+    fields: 'nextPageToken,items(id,etag,summary,description,start,end,extendedProperties,colorId,transparency,created)'
   });
   const data = await gcalFetch(
     token,
     `/calendars/${encodeURIComponent(calendarId)}/events?${params}`
   );
+  if (data.nextPageToken) throw new Error('calendar-read-incomplete');
   return data.items || [];
 }
 
-async function patchEvent(token, calendarId, eventId, body) {
+async function patchEvent(token, calendarId, eventId, body, etag) {
+  if (!etag) throw new Error('missing-event-etag');
   return gcalFetch(
     token,
     `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
-    { method: 'PATCH', body: JSON.stringify(body) }
+    { method: 'PATCH', headers: { 'If-Match': etag }, body: JSON.stringify(body) }
   );
 }
 
 // ⭐ v1.18.0: 일정 삭제 — 바디코디에서 취소·삭제된 예약, 같은 예약의 중복 일정만 지운다
 //   (구글 캘린더 휴지통에 30일간 남아 복구 가능). 이미 지워진 일정(404/410)은 성공으로 본다.
 async function deleteEvent(token, calendarId, eventId) {
+  if (!activeWriter) throw new Error('coordination-not-configured');
+  return activeWriter.execute(async () => {
   const res = await fetch(
     `${CALENDAR_API}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
     { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }
   );
   if (res.ok || res.status === 404 || res.status === 410) return true;
   const text = await res.text();
-  throw new Error(`GCal ${res.status}: ${text}`);
+  const error = new Error(`GCal ${res.status}: ${text}`);
+  error.status = res.status;
+  throw error;
+  });
 }
 
 // ⭐ v1.14.0: 캘린더 일정 생성
@@ -518,19 +537,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
           return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${sign}${p(Math.floor(Math.abs(tz) / 60))}:${p(Math.abs(tz) % 60)}`;
         };
 
-        // 총횟수/잔여횟수 추출 헬퍼
-        const getCountField = (ev, candidates) => {
-          for (const k of candidates) {
-            const v = ev[k];
-            if (typeof v === 'number' && Number.isFinite(v)) return v;
-            if (typeof v === 'string' && /^-?\d+$/.test(v.trim())) return parseInt(v, 10);
-          }
-          return null;
-        };
-        const TOTAL_KEYS  = ['tot_count','total_count','tot_cnt','total_cnt','tot_use_cnt','total_use_count','totalCount','totCount','totCnt','totalCnt','useTotalCount','contractTotalCount','tot_service_cnt','service_total_count','reservation_total_count'];
-        // ⭐ BodyCodi 실제 필드: remainNumber (잔여), useNumber (사용)
-        const REMAIN_KEYS = ['remainNumber','remain_count','rest_count','remain_cnt','rest_cnt','remain_use_cnt','rest_use_cnt','remainCount','remainCnt','restCount','restCnt','remainUseCount','avail_count','available_count','availableCount','left_count','leftCount'];
-        const USE_KEYS    = ['useNumber','use_count','used_count','useCount','usedCount','use_cnt','used_cnt'];
+        // Count field names are deliberately not guessed; see docs/enrichment-rollout.md.
 
         // ⭐ v1.13.0: 이용권 유효기간(만료일/시작일) 후보 필드명
         //   start_date / end_date 는 "예약 시각"이므로 반드시 제외한다
@@ -743,31 +750,11 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
             _hiddenSamples.length < 3 && _hiddenSamples.push({ text: raw.slice(0, 24), status: statusPairs.join(',') });
           }
 
-          // 잔여횟수: BodyCodi의 remainNumber 필드
-          const remainCount = getCountField(ev, REMAIN_KEYS);
-          // 사용횟수: BodyCodi의 useNumber 필드 (총횟수 계산용)
-          const useCount    = getCountField(ev, USE_KEYS);
+          // Scheduler badges may aggregate multiple passes. Until an exact
+          // appointment-to-pass adapter is verified, leave existing counts intact.
+          const remainCount = null;
+          const totalCount = null;
 
-          // 총횟수 우선순위:
-          //   1) 직접 필드 (TOTAL_KEYS 중 하나)
-          //   2) remainNumber + useNumber 계산
-          //   3) 프로그램 텍스트의 "N회" regex 폴백
-          let totalCount = getCountField(ev, TOTAL_KEYS);
-          if (totalCount === null && remainCount !== null && useCount !== null) {
-            totalCount = remainCount + useCount;
-          }
-          if (totalCount === null) {
-            const tm = (program || raw).match(/(\d+)\s*회(?!원|차)/);  // "회원", "회차"는 제외
-            if (tm) totalCount = parseInt(tm[1], 10);
-          }
-
-          // ⭐ v1.9.0: 회차 계산 fallback — 사용횟수 + 1 (이번 회차)
-          if (isAssessment && round === null && useCount !== null) {
-            round = useCount + 1;
-          }
-
-          // ⭐ v1.13.0: 이용권 유효기간 (만료일 필수, 시작일은 있으면 "시작 ~ 만료"로 표기)
-          //   예약 당일 날짜는 후보에서 제외 (예약 시각 필드가 다른 이름으로 중복 실려 오는 경우 오인 방지)
           const eventDays = new Set([toYmd(ev.start_date), toYmd(ev.end_date)].filter(Boolean));
           const expire = getDateField(ev, EXPIRE_KEYS, /(end|expir|limit|valid|deadline|만료|종료)/i, eventDays);
           const vstart = expire.value
@@ -837,6 +824,7 @@ async function extractSchedulesFromBodyCodi(tabId, { rangeStart, rangeEnd, resto
             status:      String(ev.now_state || ev.status || ''),
             totalCount,
             remainCount,
+            countStatus: 'unverified-scheduler-pass-mapping',
             validPeriod,
             isAssessment,
             round,
@@ -919,24 +907,16 @@ async function readNetLogFromBodyCodi() {
 function isCustomerBooking(ev) {
   const t = ev.text || '';
   if (!t) return false;
-  // ⭐ v1.9.1: 평가 프로그램(동작기능평가/관절기능평가)은 항상 고객 예약으로 취급 (최우선 체크)
-  //   "원장개인업무용" 같은 이름 안에 "개인업무"가 우연히 포함될 수 있어,
-  //   아래 제외 키워드 체크보다 반드시 먼저 판정해야 함
-  if (ev.isAssessment) return true;
+  // An assessment label alone does not prove this is a member reservation.
+  if (/원장.*(?:센터|개인).*업무|기타스케줄|공지/.test(t)) return false;
   if (/기타스케줄|개인업무|휴무|점심|회의/.test(t)) return false;
-  // 이름과 회원번호가 둘 다 없으면 스킵
-  if (!ev.memberName && !ev.memberNo) return false;
-  return true;
+  // Legacy extraction has no verified member key: require all visible identifiers.
+  return !!(ev.memberNo && ev.memberName && ev.phone);
 }
 
 // 새 제목: "회원번호 성함 연락처 프로그램이름" (회원번호 없으면 생략)
 function buildTitle(ev) {
-  const parts = [];
-  if (ev.memberNo) parts.push(ev.memberNo);
-  if (ev.memberName) parts.push(ev.memberName);
-  if (ev.phone) parts.push(ev.phone);
-  if (ev.program) parts.push(ev.program);
-  return parts.join(' ');
+  return ReservationEnrichment.title(ev);
 }
 
 // 기존 description에서 우리가 관리하는 라인만 골라서 제거 → 사용자 콘텐츠만 남김
@@ -973,24 +953,14 @@ function stripManagedLines(description) {
 // ⭐ v1.13.0: 자동 라인 목록 (값이 있는 항목만, 고정 순서)
 //   프로그램명 → 유효기간 → 총횟수 → 잔여횟수
 function buildAutoLines(ev) {
-  const auto = [];
-  if (ev.program) auto.push(`프로그램명 : ${ev.program}`);
-  if (ev.validPeriod) auto.push(`유효기간 : ${ev.validPeriod}`);
-  if (ev.totalCount  !== null && ev.totalCount  !== undefined) auto.push(`총횟수 : ${ev.totalCount}회`);
-  if (ev.remainCount !== null && ev.remainCount !== undefined) auto.push(`잔여횟수 : ${ev.remainCount}회`);
-  return auto;
+  return ReservationEnrichment.autoLines(ev);
 }
 
 // 새 description = 사용자 콘텐츠 + (선택적) 빈 줄 + 자동 라인
 // ev: { program, validPeriod, totalCount, remainCount, ... }
 // existingDescription: GCal에 이미 들어 있던 description
 function buildDescription(ev, existingDescription) {
-  const userContent = stripManagedLines(existingDescription);
-  const auto = buildAutoLines(ev);
-
-  if (auto.length === 0) return userContent;            // 자동 정보 없으면 사용자 콘텐츠만
-  if (!userContent)      return auto.join('\n');        // 사용자 콘텐츠 없으면 자동 정보만
-  return `${userContent}\n\n${auto.join('\n')}`;         // 둘 다 있으면 사용자 + 빈줄 + 자동
+  return ReservationEnrichment.description(ev, existingDescription);
 }
 
 // ---------- 메인 동기화 ----------
@@ -1019,6 +989,18 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     token = await getAuthToken(true);
   }
   reportProgress(10, 'Google 인증 완료');
+
+  // All mutating PC runs require the same provisioned coordination resource.
+  // Dry runs remain available while rollout is blocked.
+  if (!dryRun) {
+    const { coordinationEvent } = await chrome.storage.local.get('coordinationEvent');
+    if (Object.values(coachCalendarMap).includes(coordinationEvent?.calendarId)) {
+      throw new Error('coordination-calendar-must-be-separate');
+    }
+    activeWriter = new BodyCodiWriter.WriterLock(
+      BodyCodiWriter.calendarApi(fetch, async () => token), coordinationEvent, crypto.randomUUID());
+    await activeWriter.acquire();
+  }
 
   // ⭐ v1.16.0: 최신 데이터 확보 — 동기화 전용 새 탭에서 읽는다 (실패 시 수동 실행만 열린 탭으로 대체)
   const { rangeStart, rangeEnd } = getSyncRange(new Date());
@@ -1050,10 +1032,14 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     if (freshTabId) { try { await chrome.tabs.remove(freshTabId); } catch (_) {} }
   }
   const { events, _diagnostics } = extracted;
+  await appendLog('Counts preserved: appointment/pass mapping and scheduler semantics are unverified');
   await appendLog(`📥 BodyCodi 전체 이벤트: ${events.length} (출처: ${freshOk ? '새로 연 화면 — 최신' : '열려 있던 탭 — 최신이 아닐 수 있음'})`);
 
   // 진단 로그
   const pf = _diagnostics?.prefetch || {};
+  if (!dryRun && (!freshOk || !pf.attempted || !pf.complete || pf.waitModes?.includes('timeout'))) {
+    throw new Error('source-not-fresh-complete');
+  }
   if (_diagnostics) {
     if (pf.attempted) {
       const perWeek = (pf.weekCounts || []).map((n, i) => `${i + 1}주차=${n}건`).join(', ');
@@ -1170,8 +1156,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       await appendLog(`📖 ${grp.label} → ${calId}: GCal ${list.length}건`);
     } catch (err) {
       await appendLog(`❌ 캘린더 조회 실패 (${calId}): ${err.message}`);
-      summary.failed += grp.active.length;
-      byCal.delete(calId);
+      throw err; // Do not plan from an incomplete multi-calendar read.
     }
   }
 
@@ -1504,7 +1489,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
               summary: createTitle,
               description: buildDescription(bc, twin.description),
               extendedProperties: { private: { bcSyncId: bc.id } }
-            });
+            }, twin.etag);
             summary.matched++; summary.updated++;
             summary.details.push({ 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: true, 변경예정: true, 완료: true, 기존제목: twin.summary, 새제목: createTitle });
             await appendLog(`🔗 ${memberLabel}: 방금 생긴 같은 예약 일정("${twin.summary}")을 연결 — 새로 만들지 않음`);
@@ -1610,12 +1595,12 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         }
         const oldStartLabel = hhmm(match.start?.dateTime);
         try {
-          await patchEvent(token, calId, match.id, patchBody);
+          await patchEvent(token, calId, match.id, patchBody, match.etag);
         } catch (e) {
           // 색 지우기(null)를 거부하는 경우 대비: 색 없이 한 번 더
           if (!(wasCancelled && /GCal 400/.test(e.message))) throw e;
           delete patchBody.colorId;
-          await patchEvent(token, calId, match.id, patchBody);
+          await patchEvent(token, calId, match.id, patchBody, match.etag);
         }
         summary.updated++;
         if (timeChanged) summary.timeMoved++;
@@ -1678,7 +1663,12 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   reportProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
   return { summary };
   } finally {
-    isSyncing = false;   // 성공/실패와 무관하게 반드시 잠금 해제
+    try {
+      if (activeWriter) {
+        const released = await activeWriter.release();
+        if (!released && activeWriter.held) await appendLog('Shared writer retained: uncertain write; operator recovery required');
+      }
+    } finally { activeWriter = null; isSyncing = false; }
   }
 }
 

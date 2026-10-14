@@ -1,0 +1,9 @@
+{
+  "name": "bodycodi-sync",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "check": "node --check background.js && node --check popup.js && node --check bc-netlog.js && node --check reservation-enrichment.js && node --check shared-writer.js && node --check cloud/enrich.js"
+  },
+  "engines": { "node": ">=22" }
+}
