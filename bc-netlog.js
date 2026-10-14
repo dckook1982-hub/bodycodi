@@ -19,22 +19,31 @@
   if (window.__bcNetLog) return;
 
   const LOG = [];
-  const inflight = new Map();   // 요청번호 → 시작 시각
+  const inflight = new Map();   // 요청번호 → { t: 시작 시각, path: 주소(경로만, 검색어 제외) }
   const recentStarts = [];      // 최근 요청 시작 시각 (최대 100개)
   let reqSeq = 0, lastEnd = 0;
-  const netStart = () => {
+  const pathOf = (url) => {
+    try { return new URL(String(url || ''), location.href).pathname; } catch (e) { return ''; }
+  };
+  const netStart = (url) => {
     const id = ++reqSeq, t = Date.now();
-    inflight.set(id, t);
+    inflight.set(id, { t, path: pathOf(url) });
     recentStarts.push(t); if (recentStarts.length > 100) recentStarts.shift();
     return id;
   };
   const netEnd = (id) => { if (inflight.delete(id)) lastEnd = Date.now(); };
   // since 이후에 시작된 요청: 진행 중 개수 / 시작된 개수 / 마지막 완료 시각
+  //   ⭐ v1.18.1: 끝나지 않은 요청의 경로(검색어 제외)도 함께 — 화면 로딩 시간초과 원인 진단용
   window.__bcNetActivity = (since) => {
     let busy = 0;
-    for (const t of inflight.values()) if (t >= since) busy++;
+    const pending = [];
+    for (const r of inflight.values()) {
+      if (r.t < since) continue;
+      busy++;
+      if (pending.length < 3 && r.path && !pending.includes(r.path)) pending.push(r.path);
+    }
     const started = recentStarts.filter(t => t >= since).length;
-    return { busy, started, lastEnd };
+    return { busy, started, lastEnd, pending };
   };
   const MAX_ENTRIES = 60;
   const MAX_HITS = 40;
@@ -83,7 +92,7 @@
   const origFetch = window.fetch;
   if (typeof origFetch === 'function') {
     window.fetch = function (input, init) {
-      const rid = netStart();
+      const rid = netStart(typeof input === 'string' ? input : (input && input.url) || '');
       let p;
       try { p = origFetch.apply(this, arguments); } catch (e) { netEnd(rid); throw e; }
       p.then(() => netEnd(rid), () => netEnd(rid));
@@ -108,7 +117,7 @@
     return origOpen.apply(this, arguments);
   };
   XP.send = function () {
-    const rid = netStart();
+    const rid = netStart(this.__bcUrl);
     this.addEventListener('loadend', () => netEnd(rid), { once: true });
     this.addEventListener('load', () => {
       try {
