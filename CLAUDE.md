@@ -8,13 +8,10 @@
 2. `README.md`의 "📌 버전" 목록 맨 위에 변경 요약을 추가한다.
 3. `node --check background.js popup.js bc-netlog.js` 로 문법 확인. 동기화 로직을 건드렸으면 chrome/fetch를 모킹한 runSync 시뮬레이션으로 검증한다.
 4. 작업 브랜치에 커밋·푸시 → `main`으로 PR 생성 → 머지. (main에 올라가야 자동 배포가 시작된다)
-5. **Google Drive 버전 아카이브**: 아래 폴더 안에 `v{version}` 폴더를 만들고, 저장소 파일을 **압축 풀린 상태 그대로** 올린다 (`.git`, `.gitignore` 제외, `icons/` 하위 폴더 포함).
+5. **Google Drive 버전 아카이브 = ZIP** (v1.18.1 다음 버전부터, 원장님 결정): 아래 6·7번의 ZIP 2개를 첨부하면 **원장님이 직접** 아래 폴더 안 `v{version}` 폴더에 올린다. Claude가 Drive에 파일을 풀어서 올리지 않는다 (Drive MCP는 내용을 글자로 옮겨 적어야 해서 ZIP은 깨질 위험이 크다). 첨부할 때 "Drive v{version} 폴더에 두 ZIP을 올려 주세요"라고 안내한다.
    - 폴더: https://drive.google.com/drive/folders/1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx (ID `1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`)
-   - Google Drive MCP `create_file`로 올릴 때: 텍스트 파일은 `textContent`, PNG·BOM이 있는 `.ps1`은 `base64Content`. **반드시 `disableConversionToGoogleType: true`** (빠뜨리면 PNG가 Google 문서로 변환된다).
-   - 업로드 후 응답의 `fileSize`가 로컬 바이트 수(`wc -c`)와 같은지 전부 확인한다.
-   - 바뀌지 않은 파일은 이전 버전 폴더에서 `copy_file`로 복사한다 (전사 오류 없음).
-   - 수십 KB 이상의 이미지는 base64를 손으로 옮기다 깨질 수 있다. 업로드가 거부되면 다시 시도하지 말고, 같은 폴더에 "받는 곳" 안내 txt(GitHub 링크·ZIP 경로)를 남긴다.
-6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
+   - v1.18.1까지는 파일을 푼 상태로 올려 두었다 (그대로 둔다).
+6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`, `.gitignore`·`.claude/` 제외)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
 7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다.
    - **웹스토어 항목은 이미 있다**: 이름 "BodyCodi → Google Calendar Sync", 항목 ID `heojbjjphafhlepaopagaejebacclfmc`, 상태 "게시됨 - 미등록". 새 항목을 만들지 말고 이 항목에 새 패키지를 올린다 (`MAKE-STORE-ZIP.bat`·개인키 불필요).
    - 이 ID는 unpacked ID(`clgekekmmlpiggplilhgagfkepepjelk`)와 달라서 OAuth 클라이언트가 따로 필요하다. 스토어용 ZIP의 `oauth2.client_id`만 그 클라이언트 ID로 바꾼다 (저장소의 `manifest.json`은 그대로).
