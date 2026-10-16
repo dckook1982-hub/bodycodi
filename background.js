@@ -1152,6 +1152,22 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
 
   // ⭐ v1.14.0: 설정 — 짝 없는 예약을 캘린더에 새로 만들지 (기본 켬)
   const { createMissing = true } = await chrome.storage.local.get('createMissing');
+
+  // ⭐ v1.18.3: 새 예약 유예 — 바디코디 자체 구글 캘린더 연동이 몇 분 뒤 같은 예약 일정을 만든다.
+  //   확장이 먼저 만들면 잠깐 2개가 보이므로, 처음 본 지 12분이 안 된 예약은 만들지 않고 기다렸다가
+  //   다음 동기화 때 연동이 만든 일정을 연결(제목·예약번호 정리)하거나, 없으면 그때 만든다.
+  //   (처음 본 시각은 PC별로 기록. 처음 설치·업데이트 직후 첫 실행은 기준만 잡고 기다리지 않는다)
+  const NEW_BOOKING_GRACE_MS = 12 * 60 * 1000;
+  const nowMs = Date.now();
+  const { bcFirstSeen } = await chrome.storage.local.get('bcFirstSeen');
+  const firstSeen = {};
+  for (const ev of activeEvents) {
+    if (!ev.id) continue;
+    firstSeen[ev.id] = (bcFirstSeen && bcFirstSeen[ev.id] !== undefined) ? bcFirstSeen[ev.id] : (bcFirstSeen ? nowMs : 0);
+  }
+  await chrome.storage.local.set({ bcFirstSeen: firstSeen });
+  const graceLeftMs = (bc) => (bc.id && firstSeen[bc.id]) ? Math.max(0, NEW_BOOKING_GRACE_MS - (nowMs - firstSeen[bc.id])) : 0;
+  const waitingNames = [];
   const coverageOk = !!(pf.attempted && pf.complete);
 
   // ---------- 1단계: 캘린더별로 묶고, 모든 캘린더를 먼저 조회 ----------
@@ -1584,6 +1600,13 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         if (tsOf(endIso) === null || tsOf(endIso) <= startTs) {
           endIso = new Date(startTs + 60 * 60 * 1000).toISOString();   // 종료 없으면 1시간
         }
+        // ⭐ v1.18.3: 방금 생긴 예약 — 바디코디 연동 일정을 기다렸다가 다음 동기화 때 연결·생성
+        if (graceLeftMs(bc) > 0) {
+          summary.waiting = (summary.waiting || 0) + 1;
+          waitingNames.push(memberLabel);
+          summary.details.push({ 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: false, 변경예정: false, 대기: true });
+          continue;
+        }
         const det = { 시작: bc.start, 회원: `${bc.memberNo} ${bc.memberName}`.trim(), 프로그램: bc.program, 매칭: false, 변경예정: true, 생성: true, 새제목: createTitle };
         if (dryRun) { summary.details.push(det); continue; }
         // ⭐ v1.18.0: 만들기 직전에 그 시각을 다시 확인 — 다른 PC나 바디코디 자체 연동이 방금 만든 일정이 있으면 그걸 쓴다
@@ -1761,6 +1784,9 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     }
   }
 
+  if (waitingNames.length) {
+    await appendLog(`⏳ 방금 생긴 예약 ${waitingNames.length}건 — 바디코디 자체 연동 일정을 기다렸다가 다음 동기화 때 연결·생성 (${waitingNames.slice(0, 5).join(', ')}${waitingNames.length > 5 ? ' …' : ''})`);
+  }
   const alreadyOkCount = (summary.details || []).filter(d => d.사유 === '이미 동기화됨').length;
   if (summary.orphans.length) {
     await appendLog(`📍 바디코디 예약과 연결되지 않은 캘린더 고객 일정 ${summary.orphans.length}건 (그대로 둠, 팝업 결과에서 사유 확인)`);

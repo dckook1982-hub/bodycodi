@@ -214,12 +214,13 @@ function renderResult(details, dryRun, orphans) {
   const created = rest.filter(d => d.생성 && !d.실패);
   const moved   = rest.filter(d => d.시간이동 && !d.실패);
   const updated = rest.filter(d => !d.생성 && !d.시간이동 && !d.실패 && (d.완료 || (dryRun && d.변경예정)));
-  const skipped = rest.filter(d => d.매칭 === false && !d.생성 && !d.실패);
+  const skipped = rest.filter(d => d.매칭 === false && !d.생성 && !d.실패 && !d.대기);
+  const waiting = rest.filter(d => d.대기);                                         // ⭐ v1.18.3
 
   const alreadyOk = list.filter(d => d.사유 === '이미 동기화됨').length;
   const orphanList = orphans || [];
 
-  if (!failed.length && !cancelled.length && !dups.length && !coachMv.length && !restored.length && !created.length && !moved.length && !updated.length && !skipped.length && !orphanList.length) {
+  if (!failed.length && !cancelled.length && !dups.length && !coachMv.length && !restored.length && !created.length && !moved.length && !updated.length && !skipped.length && !waiting.length && !orphanList.length) {
     return `✅ 조치가 필요한 항목이 없습니다.\n   (${alreadyOk}건 모두 이미 동기화된 상태)`;
   }
 
@@ -254,6 +255,9 @@ function renderResult(details, dryRun, orphans) {
 
   addSection('✏️', dryRun ? '제목/설명 변경 예정' : '제목/설명 업데이트됨', updated, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}\n     ${d.새제목 || ''}`);
+
+  addSection('⏳', '방금 생긴 예약 — 바디코디 연동 일정을 기다렸다가 다음 동기화 때 연결·생성', waiting, d =>
+    `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
 
   addSection('⏭️', '캘린더에 짝이 되는 일정이 없어 건너뜀 (새로 만들기 꺼짐)', skipped, d =>
     `   · ${fmtWhen(d.시작)}  ${(d.회원 || '').trim()}  /  ${d.프로그램 || ''}`);
@@ -299,7 +303,8 @@ function runSync(dryRun) {
     const dupCount = dryRun ? (s.details || []).filter(d => d.중복).length : (s.dedup || 0);
     const extraText = (cancelCount ? ` · 🗑️취소삭제=${cancelCount}` : '') + (dupCount ? ` · 🧹중복삭제=${dupCount}` : '') +
       (coachMvCount ? ` · 🔀강사변경=${coachMvCount}` : '') +
-      (s.goneHeld ? ` · ⏸️삭제보류=${s.goneHeld}(로그 확인)` : '');   // ⭐ v1.17.0
+      (s.goneHeld ? ` · ⏸️삭제보류=${s.goneHeld}(로그 확인)` : '') +   // ⭐ v1.17.0
+      (s.waiting ? ` · ⏳새예약대기=${s.waiting}` : '');                  // ⭐ v1.18.3
 
     setStatus(
       dryRun
