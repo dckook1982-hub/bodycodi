@@ -8,9 +8,14 @@
 2. `README.md`의 "📌 버전" 목록 맨 위에 변경 요약을 추가한다.
 3. `node --check background.js popup.js bc-netlog.js` 로 문법 확인. 동기화 로직을 건드렸으면 chrome/fetch를 모킹한 runSync 시뮬레이션으로 검증한다.
 4. 작업 브랜치에 커밋·푸시 → `main`으로 PR 생성 → 머지. (main에 올라가야 자동 배포가 시작된다)
-5. **Google Drive 버전 아카이브 = ZIP** (v1.18.1 다음 버전부터, 원장님 결정): 아래 6·7번의 ZIP 2개를 첨부하면 **원장님이 직접** 아래 폴더 안 `v{version}` 폴더에 올린다. Claude가 Drive에 파일을 풀어서 올리지 않는다 (Drive MCP는 내용을 글자로 옮겨 적어야 해서 ZIP은 깨질 위험이 크다). 첨부할 때 "Drive v{version} 폴더에 두 ZIP을 올려 주세요"라고 안내한다.
-   - 폴더: https://drive.google.com/drive/folders/1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx (ID `1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`)
-   - v1.18.1까지는 파일을 푼 상태로 올려 두었다 (그대로 둔다).
+5. **Google Drive 버전 아카이브 = ZIP, Claude가 자동 업로드** (원장님 결정): 6·7번의 ZIP 2개를
+   ① 공개 저장소의 `release-zips` 브랜치에 커밋·푸시(원장님 승인, main·자동 업데이트와 무관) →
+   ② 공개 주소 `https://raw.githubusercontent.com/dckook1982-hub/bodycodi/release-zips/<파일명>`를 내려받아 sha256이 로컬과 같은지 확인 →
+   ③ Zapier MCP의 Google Drive **Upload File**(file=그 공개 주소, folder=아래 아카이브 폴더, convert=false)로 올린다 →
+   ④ Drive MCP `search_files`로 두 파일의 `fileSize`가 로컬 바이트 수와 같은지 확인한다.
+   - 아카이브 폴더: https://drive.google.com/drive/folders/1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx (ID `1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`). ZIP은 이 폴더 바로 아래에 둔다 (원장님이 v1.18.1·v1.18.2를 이렇게 올림).
+   - Drive MCP `create_file`로 ZIP을 base64로 옮겨 적지 않는다 (깨질 위험). Zapier 연결이 없거나 실패하면 ZIP을 첨부하고 원장님께 올려 달라고 안내한다.
+   - v1.18.1까지의 `v{version}` 폴더(파일을 푼 상태)는 그대로 둔다.
 6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`, `.gitignore`·`.claude/` 제외)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
 7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다.
    - **웹스토어 항목은 이미 있다**: 이름 "BodyCodi → Google Calendar Sync", 항목 ID `heojbjjphafhlepaopagaejebacclfmc`, 상태 "게시됨 - 미등록". 새 항목을 만들지 말고 이 항목에 새 패키지를 올린다 (`MAKE-STORE-ZIP.bat`·개인키 불필요).
