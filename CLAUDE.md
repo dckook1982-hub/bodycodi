@@ -11,8 +11,8 @@
 5. **Google Drive 버전 아카이브 = ZIP, Claude가 자동 업로드** (원장님 결정): 6·7번의 ZIP 2개를
    ① 공개 저장소의 `release-zips` 브랜치에 커밋·푸시(원장님 승인, main·자동 업데이트와 무관) →
    ② 공개 주소 `https://raw.githubusercontent.com/dckook1982-hub/bodycodi/release-zips/<파일명>`를 내려받아 sha256이 로컬과 같은지 확인 →
-   ③ Zapier MCP의 Google Drive **Upload File**(file=그 공개 주소, folder=아래 아카이브 폴더, convert=false)로 올린다 →
-   ④ Drive MCP `search_files`로 두 파일의 `fileSize`가 로컬 바이트 수와 같은지 확인한다.
+   ③ Zapier MCP의 Google Drive **Upload File**(file=그 공개 주소, folder=`1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`, convert=false, **new_name은 넣지 않는다** — 넣으면 `.zip.zip`이 됨)로 올린다 (연결: dckook1982@gmail.com, 기본 연결로 지정됨) →
+   ④ Zapier 응답의 `fileSize`·`md5Checksum`이 로컬(`wc -c`·`md5sum`)과 같은지, 파일 이름이 맞는지 확인한다 (이름이 틀리면 Drive MCP `update_file`로 고친다).
    - 아카이브 폴더: https://drive.google.com/drive/folders/1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx (ID `1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`). ZIP은 이 폴더 바로 아래에 둔다 (원장님이 v1.18.1·v1.18.2를 이렇게 올림).
    - Drive MCP `create_file`로 ZIP을 base64로 옮겨 적지 않는다 (깨질 위험). Zapier 연결이 없거나 실패하면 ZIP을 첨부하고 원장님께 올려 달라고 안내한다.
    - v1.18.1까지의 `v{version}` 폴더(파일을 푼 상태)는 그대로 둔다.
