@@ -117,6 +117,12 @@ async function listEventsInRange(token, calendarId, timeMin, timeMax) {
   return data.items || [];
 }
 
+// ⭐ v1.18.2: 쓰기 가능한 캘린더 목록 (매핑 안 된 캘린더로 옮겨 둔 일정을 찾기 위해)
+async function listWritableCalendars(token) {
+  const data = await gcalFetch(token, '/users/me/calendarList?minAccessRole=writer&maxResults=250&fields=items(id,summary,accessRole)');
+  return data.items || [];
+}
+
 async function patchEvent(token, calendarId, eventId, body) {
   return gcalFetch(
     token,
@@ -1185,6 +1191,22 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     }
   }
 
+  // ⭐ v1.18.2: 매핑 안 된 캘린더(예: "00 첫평가 예약")에 사용자가 옮겨 둔 예약 일정도 읽는다
+  //   → 그 일정을 그 자리에서 맞추고, 강사 캘린더로 되돌리거나 다시 만들지 않는다 (지우지도 않는다)
+  const mappedCalIds = new Set(Object.values(coachCalendarMap));
+  const parkedByCal = new Map();   // calId → { label, list }
+  try {
+    for (const c of await listWritableCalendars(token)) {
+      if (!c.id || mappedCalIds.has(c.id)) continue;
+      try {
+        const list = (await listEventsInRange(token, c.id, rangeStart, rangeEnd)).filter(g => g.start?.dateTime);
+        if (list.length) parkedByCal.set(c.id, { label: c.summary || c.id, list });
+      } catch (e) { /* 읽을 수 없는 캘린더는 건너뜀 */ }
+    }
+  } catch (e) {
+    await appendLog(`ℹ️ 다른 캘린더 목록을 읽지 못함 (${e.message}) — 옮겨 둔 일정 확인은 이번엔 생략`);
+  }
+
   // ---------- 2단계: 매칭 계획 (모든 캘린더) ----------
   const claimed = new Set();                  // `${calId}|${eventId}`
   const ck = (calId, g) => `${calId}|${g.id}`;
@@ -1217,11 +1239,46 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     grp.active = kept;
   }
 
+  // 0차) ⭐ v1.18.2: 매핑 안 된 캘린더로 옮겨 둔 일정 — 예약번호 마커가 같거나, 같은 시각(±3분)·같은 회원
+  const parkedNames = [];
+  if (parkedByCal.size) {
+    const findParked = (bc, byMarker) => {
+      const bcStart = tsOf(bc.start), key = memberKeyOfBc(bc);
+      for (const [pCal, { label, list }] of parkedByCal) {
+        const g = list.find(x => {
+          if (claimed.has(ck(pCal, x))) return false;
+          const sid = x.extendedProperties?.private?.bcSyncId;
+          if (byMarker) return !!(bc.id && sid === bc.id);
+          if (sid && sid !== bc.id && activeIds.has(sid)) return false;   // 다른 살아 있는 예약의 일정
+          const t = tsOf(x.start?.dateTime);
+          return !!key && bcStart !== null && t !== null && Math.abs(t - bcStart) <= 3 * 60 * 1000 && memberKeyOfGcal(x) === key;
+        });
+        if (g) return { pCal, label, g };
+      }
+      return null;
+    };
+    for (const byMarker of [true, false]) {
+      for (const [, grp] of byCal) {
+        for (const bc of grp.active) {
+          if (matchOf.has(bc)) continue;
+          const hit = findParked(bc, byMarker);
+          if (!hit) continue;
+          take(bc, hit.pCal, hit.g);
+          matchOf.get(bc).parked = hit.label;
+          parkedNames.push(`${(bc.memberNo || '')} ${bc.memberName || ''}`.trim() + `→${hit.label}`);
+        }
+      }
+    }
+    if (parkedNames.length) {
+      await appendLog(`📌 다른 캘린더로 옮겨 둔 예약 ${parkedNames.length}건 — 그 자리에서 맞추고 강사 캘린더에 다시 만들지 않음 (${parkedNames.slice(0, 5).join(', ')}${parkedNames.length > 5 ? ' …' : ''})`);
+    }
+  }
+
   // 1차) 같은 캘린더의 예약번호 마커 / 레거시 태그
   for (const [calId, grp] of byCal) {
     const list = gcalByCal.get(calId) || [];
     for (const bc of grp.active) {
-      if (!bc.id) continue;
+      if (!bc.id || matchOf.has(bc)) continue;
       const syncTag = `[bc-sync:${bc.id}]`;
       const m =
         list.find(g => !claimed.has(ck(calId, g)) && g.extendedProperties?.private?.bcSyncId === bc.id) ||
@@ -1434,10 +1491,19 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     for (const bc of grp.active) {
       const kept = matchOf.get(bc);
       if (!kept) continue;
+      const keptTitle = (kept.parked ? `[${kept.parked}] ` : '') + (kept.g.summary || '');
       for (const g of slotTwins(list, calId, bc)) {
         if (g === kept.g) continue;
         claimed.add(ck(calId, g));
-        dupPlan.push({ calId, g, bc, keptTitle: kept.g.summary || '' });
+        dupPlan.push({ calId, g, bc, keptTitle });
+      }
+      // ⭐ v1.18.2: 옮겨 둔 예약 — 강사 캘린더에 남아 있는 같은 예약번호의 일정(예전에 다시 만들어진 것)도 중복
+      if (kept.parked) {
+        for (const h of markerIndex.get(bc.id) || []) {
+          if (claimed.has(ck(h.calId, h.g))) continue;
+          claimed.add(ck(h.calId, h.g));
+          dupPlan.push({ calId: h.calId, g: h.g, bc, keptTitle });
+        }
       }
     }
   }
@@ -1482,7 +1548,8 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
       let calMoveInfo = null;
 
       // ⭐ v1.16.0: 담당 강사가 바뀌어 다른 캘린더에 있는 일정 → 이 캘린더로 옮긴다 (삭제 아님)
-      if (match && plan.calId !== calId) {
+      const targetCal = plan?.parked ? plan.calId : calId;   // ⭐ v1.18.2: 옮겨 둔 일정은 그 캘린더에서 고친다
+      if (match && plan.calId !== calId && !plan.parked) {
         const fromLabel = byCal.get(plan.calId)?.label || plan.calId;
         if (dryRun) {
           summary.details.push({ 시작: bc.start, 회원: memberLabel, 프로그램: bc.program, 매칭: true, 변경예정: true,
@@ -1637,12 +1704,12 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
         }
         const oldStartLabel = hhmm(match.start?.dateTime);
         try {
-          await patchEvent(token, calId, match.id, patchBody);
+          await patchEvent(token, targetCal, match.id, patchBody);
         } catch (e) {
           // 색 지우기(null)를 거부하는 경우 대비: 색 없이 한 번 더
           if (!(wasCancelled && /GCal 400/.test(e.message))) throw e;
           delete patchBody.colorId;
-          await patchEvent(token, calId, match.id, patchBody);
+          await patchEvent(token, targetCal, match.id, patchBody);
         }
         summary.updated++;
         if (timeChanged) summary.timeMoved++;
