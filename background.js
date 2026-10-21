@@ -1157,7 +1157,9 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
   //   확장이 먼저 만들면 잠깐 2개가 보이므로, 처음 본 지 12분이 안 된 예약은 만들지 않고 기다렸다가
   //   다음 동기화 때 연동이 만든 일정을 연결(제목·예약번호 정리)하거나, 없으면 그때 만든다.
   //   (처음 본 시각은 PC별로 기록. 처음 설치·업데이트 직후 첫 실행은 기준만 잡고 기다리지 않는다)
-  const NEW_BOOKING_GRACE_MS = 12 * 60 * 1000;
+  //   ⭐ v1.18.4: 수동 "지금 동기화"는 기다리지 않고 바로 만든다 (자동·변경 감지·후속 동기화만 대기, 10분)
+  const NEW_BOOKING_GRACE_MS = 10 * 60 * 1000;
+  const isAutoRun = String(trigger).startsWith('alarm');
   const nowMs = Date.now();
   const { bcFirstSeen } = await chrome.storage.local.get('bcFirstSeen');
   const firstSeen = {};
@@ -1166,7 +1168,7 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     firstSeen[ev.id] = (bcFirstSeen && bcFirstSeen[ev.id] !== undefined) ? bcFirstSeen[ev.id] : (bcFirstSeen ? nowMs : 0);
   }
   await chrome.storage.local.set({ bcFirstSeen: firstSeen });
-  const graceLeftMs = (bc) => (bc.id && firstSeen[bc.id]) ? Math.max(0, NEW_BOOKING_GRACE_MS - (nowMs - firstSeen[bc.id])) : 0;
+  const graceLeftMs = (bc) => (isAutoRun && bc.id && firstSeen[bc.id]) ? Math.max(0, NEW_BOOKING_GRACE_MS - (nowMs - firstSeen[bc.id])) : 0;
   const waitingNames = [];
   const coverageOk = !!(pf.attempted && pf.complete);
 
@@ -1796,6 +1798,9 @@ async function runSync({ trigger = 'manual', dryRun = false } = {}) {
     `matched=${summary.matched} updated=${summary.updated} 시간이동=${summary.timeMoved} 생성=${summary.created} 취소삭제=${summary.cancelled} 중복삭제=${summary.dedup || 0} 복구=${summary.restored} 강사이동=${summary.calMoved} 이미동기화=${alreadyOkCount} skipped=${summary.skipped} failed=${summary.failed}`
   );
   reportProgress(100, dryRun ? '미리보기 완료' : '동기화 완료');
+  if (!dryRun) {
+    try { await planFollowUp(trigger, summary); } catch (e) { /* 후속 예약 실패는 무시 (정기 동기화가 이어서 처리) */ }
+  }
   return { summary };
   } finally {
     isSyncing = false;   // 성공/실패와 무관하게 반드시 잠금 해제
@@ -1826,6 +1831,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (cmd === 'getLogs') {
         const { logs = [] } = await chrome.storage.local.get('logs');
         sendResponse({ ok: true, logs });
+        return;
+      }
+
+      // ⭐ v1.18.4: 바디코디 화면에서 예약을 저장·수정·삭제·이동하면(bc-watch.js) 1분 30초 뒤 동기화
+      if (msg && msg.__bcWatch === 'change') {
+        const r = await scheduleOnce(SOON_ALARM, SOON_DELAY_MS);
+        if (!r.existed) {
+          await appendLog(`✋ 바디코디 화면에서 예약 변경 감지("${String(msg.label || '').slice(0, 12)}") — ${hhmm(r.when)}에 동기화`);
+        }
+        sendResponse({ ok: true });
         return;
       }
 
@@ -1997,6 +2012,37 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
+// ---------- ⭐ v1.18.4: 바로바로 반영 — 변경 감지 동기화 + 후속 동기화 ----------
+//   - 변경 감지: 이 PC의 바디코디 화면에서 예약을 저장·수정·삭제·이동하면 1분 30초 뒤 한 번 동기화 (bc-watch.js)
+//   - 후속: 방금 생긴 예약을 기다리는 중이면 11분 뒤, 새로 만들거나 시간을 옮겼으면 10분 뒤 한 번 더 동기화
+//     (바디코디 자체 연동이 몇 분 늦게 만드는 같은 예약 일정을 빨리 연결·정리). 후속은 연달아 최대 2번.
+const SOON_ALARM = 'bc-soon';
+const FOLLOWUP_ALARM = 'bc-followup';
+const SOON_DELAY_MS = 90 * 1000;
+
+// 한 번만 울리는 알람 — 이미 더 이른 시각으로 잡혀 있으면 그대로 둔다
+async function scheduleOnce(name, delayMs) {
+  const when = Date.now() + delayMs;
+  const ex = await chrome.alarms.get(name);
+  if (ex && ex.scheduledTime <= when) return { when: ex.scheduledTime, existed: true };
+  await chrome.alarms.create(name, { when });
+  return { when, existed: false };
+}
+
+async function planFollowUp(trigger, summary) {
+  const isFollow = trigger === `alarm:${FOLLOWUP_ALARM}`;
+  const { followupChain = 0 } = await chrome.storage.local.get('followupChain');
+  const chain = isFollow ? followupChain + 1 : 0;
+  await chrome.storage.local.set({ followupChain: chain });
+  if (chain >= 2) return;
+  let delay = 0, why = '';
+  if (summary.waiting) { delay = 11 * 60 * 1000; why = `방금 생긴 예약 ${summary.waiting}건 연결·생성`; }
+  else if (summary.created || summary.timeMoved) { delay = 10 * 60 * 1000; why = '바디코디 연동이 뒤늦게 만드는 같은 예약 일정 정리'; }
+  if (!delay) return;
+  const r = await scheduleOnce(FOLLOWUP_ALARM, delay);
+  await appendLog(`⏭️ 후속 동기화 ${hhmm(r.when)} — ${why}`);
+}
+
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   // ⭐ v1.12.0: 자동 업데이트 확인 (동기화와 무관하게 주말에도 동작)
   if (alarm.name === AUTO_RELOAD_ALARM) {
@@ -2007,6 +2053,17 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     }
     // 자가 복구: 다음 동기화 알람이 사라졌으면 다시 건다
     try { await scheduleNextSync(); } catch (e) { /* ignore */ }
+    return;
+  }
+
+  // ⭐ v1.18.4: 변경 감지 동기화 / 후속 동기화 (한 번만 울리는 알람)
+  if (alarm.name === SOON_ALARM || alarm.name === FOLLOWUP_ALARM) {
+    if (isSyncing) { await scheduleOnce(alarm.name, 60 * 1000); return; }   // 진행 중이면 1분 뒤 다시
+    try {
+      await runSync({ trigger: `alarm:${alarm.name}`, dryRun: false });
+    } catch (err) {
+      await appendLog(`❌ ${alarm.name === SOON_ALARM ? '변경 감지' : '후속'} 동기화 실패: ${err.message}`);
+    }
     return;
   }
 

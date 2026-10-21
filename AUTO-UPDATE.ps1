@@ -31,8 +31,26 @@ function Log([string]$msg) {
     } catch {}
 }
 
+# v1.18.4: 크롬은 확장 폴더 안에 desktop.ini / Thumbs.db 가 있으면 확장을 불러오지 못한다
+#   ("Cannot load extension with file or directory name desktop.ini" 경고 -> 새 버전 적용 실패)
+#   윈도우·동기화 프로그램이 만든 이 파일들을 실행할 때마다 지운다.
+function Remove-WindowsJunk {
+    try {
+        Get-ChildItem -Path $dir -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @('desktop.ini', 'Thumbs.db') } |
+            ForEach-Object {
+                try {
+                    $_.Attributes = 'Normal'
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                    Log "정리: $($_.FullName) 삭제 (크롬 확장 불러오기 오류 방지)"
+                } catch {}
+            }
+    } catch {}
+}
+
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Remove-WindowsJunk
 
     # ----- 로컬 버전 -----
     $localManifest = Join-Path $dir 'manifest.json'
@@ -91,9 +109,9 @@ try {
     if ($zipVer -ne $remoteVer) { throw "ZIP 버전($zipVer)이 원격 버전($remoteVer)과 다릅니다" }
 
     # ----- 복사 (설치 스크립트/키/토큰/로그 제외, manifest.json 은 마지막) -----
-    $skip = @('INSTALL.bat', 'UNINSTALL.bat', 'SETUP-PERMANENT.ps1', 'github-token.txt', 'update.log', '*.pem', '.git*', '.github')
+    $skip = @('INSTALL.bat', 'UNINSTALL.bat', 'SETUP-PERMANENT.ps1', 'github-token.txt', 'update.log', '*.pem', '.git*', '.github', 'desktop.ini', 'Thumbs.db')
     $files = Get-ChildItem -Path $src -Recurse -File | Where-Object {
-        $f = $_; -not ($skip | Where-Object { $f.Name -like $_ }) -and ($f.FullName -notmatch '[\\/]\.git[\\/]')
+        $f = $_; -not ($skip | Where-Object { $f.Name -like $_ }) -and ($f.FullName -notmatch '[\\/]\.(git|claude)[\\/]')
     }
     $copied = 0
     foreach ($f in ($files | Where-Object { $_.Name -ne 'manifest.json' })) {
@@ -104,6 +122,7 @@ try {
         Copy-Item -Path $f.FullName -Destination $target -Force
         $copied++
     }
+    Remove-WindowsJunk   # 새 버전 적용(manifest 교체) 직전에 한 번 더
     Copy-Item -Path $srcManifest.FullName -Destination $localManifest -Force
     $copied++
 
