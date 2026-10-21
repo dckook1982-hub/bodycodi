@@ -33,10 +33,10 @@ if (-not (Test-Path $dstDir)) {
 }
 
 # 설치에 필요한 항목만 복사 (자기 자신, zip, .pem 등은 제외)
-$excludeNames = @('SETUP-PERMANENT.ps1', 'INSTALL.bat', 'UNINSTALL.bat', 'bodycodi-sync.zip', '*.pem', '.git', '.github', 'update.log')
+$excludeNames = @('SETUP-PERMANENT.ps1', 'INSTALL.bat', 'UNINSTALL.bat', 'bodycodi-sync.zip', '*.pem', '.git', '.github', 'update.log', 'desktop.ini', 'Thumbs.db')
 Get-ChildItem -Path $srcDir -Recurse | Where-Object {
     $relPath = $_.FullName.Substring($srcDir.Length).TrimStart('\')
-    $skip = $false
+    $skip = ($relPath -match '^\.(git|github|claude)([\\/]|$)')
     foreach ($pattern in $excludeNames) {
         if ($_.Name -like $pattern) { $skip = $true; break }
     }
@@ -52,6 +52,10 @@ Get-ChildItem -Path $srcDir -Recurse | Where-Object {
         Copy-Item -Path $_.FullName -Destination $target -Force
     }
 }
+# v1.18.4: 크롬은 확장 폴더 안에 desktop.ini / Thumbs.db 가 있으면 확장을 불러오지 못한다 -> 지운다
+Get-ChildItem -Path $dstDir -Recurse -Force -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @('desktop.ini', 'Thumbs.db') } |
+    ForEach-Object { try { $_.Attributes = 'Normal'; Remove-Item -LiteralPath $_.FullName -Force } catch {} }
 Write-Host "      파일 복사 완료." -ForegroundColor Green
 
 # ----- Step 2: Chrome 실행 파일 위치 찾기 -----
