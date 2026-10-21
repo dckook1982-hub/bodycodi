@@ -16,6 +16,7 @@
    - 아카이브 폴더: https://drive.google.com/drive/folders/1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx (ID `1X_SpbZxKQl1NI3zdt1J_TafHi1dp4fUx`). ZIP은 이 폴더 바로 아래에 둔다 (원장님이 v1.18.1·v1.18.2를 이렇게 올림).
    - Drive MCP `create_file`로 ZIP을 base64로 옮겨 적지 않는다 (깨질 위험). Zapier 연결이 없거나 실패하면 ZIP을 첨부하고 원장님께 올려 달라고 안내한다.
    - v1.18.1까지의 `v{version}` 폴더(파일을 푼 상태)는 그대로 둔다.
+   - v1.18.4 설치 ZIP은 Google Drive가 "멀웨어 정책 위반 가능" 경고와 함께 복사·공유를 제한했다(스크립트의 `-ExecutionPolicy Bypass`·숨김 실행·크롬 바로가기 수정 때문으로 추정, 스토어용 ZIP은 제한 없음). 원장님 결정: 검토 요청 후 지금처럼 두 ZIP 모두 업로드. 같은 경고가 오면 알리기만 하고, 암호 ZIP·확장자 변경 같은 검사 회피는 하지 않는다. 자동 업데이트는 GitHub 기준이라 영향 없음.
 6. 설치 ZIP(`bodycodi-sync-v{version}.zip`, 최상위 폴더명 `bodycodi-sync`, `.gitignore`·`.claude/` 제외)을 만들어 사용자에게 첨부한다. 자동 배포가 아직 안 잡힌 PC용.
 7. **크롬 웹스토어용 ZIP** `bodycodi-sync-store-v{version}.zip`도 만들어 첨부한다. 내용: 최상위에 바로 `manifest.json`(**`key` 줄 제거**), `*.js`, `*.html`, `*.css`, `icons/` — 스크립트·문서·`store/`·`.pem`은 넣지 않는다. 사용자는 대시보드 → 패키지 → 새 패키지 업로드로 올린다.
    - **웹스토어 항목은 이미 있다**: 이름 "BodyCodi → Google Calendar Sync", 항목 ID `heojbjjphafhlepaopagaejebacclfmc`, 상태 "게시됨 - 미등록". 새 항목을 만들지 말고 이 항목에 새 패키지를 올린다 (`MAKE-STORE-ZIP.bat`·개인키 불필요).
